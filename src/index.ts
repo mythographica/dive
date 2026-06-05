@@ -274,10 +274,50 @@ export function attachHooks (collection: {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	registerHook: (type: any, fn: any) => void;
 }): void {
+	// preCreation: the built instance does not exist yet, so stand on the parent
+	// (existentInstance) as the active context, and wrap any function arguments
+	// so callbacks handed to the constructor carry that parent context forward.
+	// mnemonica passes this same args array into the constructor, so the wrap is
+	// applied in place.
+	collection.registerHook('preCreation', (hookData: { existentInstance?: object; args?: unknown[] }) => {
+		const parent = hookData.existentInstance;
+		if (parent) {
+			setLastContext(parent);
+		}
+		const args = hookData.args;
+		if (Array.isArray(args)) {
+			for (let i = 0; i < args.length; i++) {
+				const arg = args[i];
+				if (typeof arg === 'function' && !isWrappedFunction(arg)) {
+					args[i] = wrap(arg as (...a: unknown[]) => unknown, parent);
+				}
+			}
+		}
+	});
+
+	// postCreation: the instance is built — it becomes the current context and
+	// its methods are wrapped to run in their own context.
 	collection.registerHook('postCreation', (hookData: { inheritedInstance?: object }) => {
 		if (hookData.inheritedInstance) {
 			setLastContext(hookData.inheritedInstance);
 			wrapInstanceMethods(hookData.inheritedInstance);
+		}
+	});
+
+	// creationError: construction failed. Pin the surviving parent onto the error
+	// so a decoupled consumer can recover the origin off the error object itself
+	// (the dive thesis), and enter the errored instance as the current context —
+	// falling back to the parent when there is no errored instance.
+	collection.registerHook('creationError', (hookData: { inheritedInstance?: object; existentInstance?: object }) => {
+		const errored = hookData.inheritedInstance;
+		const parent = hookData.existentInstance;
+		if (errored instanceof Error && parent) {
+			enrichError(errored, parent);
+		}
+		if (errored) {
+			setLastContext(errored);
+		} else if (parent) {
+			setLastContext(parent);
 		}
 	});
 }

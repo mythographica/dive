@@ -13,9 +13,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTypesCollection } from 'mnemonica/module';
 import type { TypesCollection } from 'mnemonica/module';
 import { attachHooks, clear } from '../src/index.js';
-import { runStressTest } from '../src/stress/runner.js';
-import { clearRegistry } from '../src/stress/registry.js';
-import { clearDlq } from '../src/stress/dlq.js';
+import { runStressTest } from './stress/runner.js';
+import { clearRegistry } from './stress/registry.js';
+import { clearDlq } from './stress/dlq.js';
 
 describe('dive stress test', () => {
 	let collection: TypesCollection;

@@ -2,7 +2,11 @@
 
 **Execution Data Storage (EDS) — context propagation for mnemonica instances.**
 
-WeakMap-based. No AsyncLocalStorage. No `async_hooks`.
+Object-bound context. No AsyncLocalStorage. No `async_hooks`.
+
+Context is pinned to userland objects (instances, error objects, identifiers),
+not to async resources. Internally: a module-global "last context" plus an
+identifier `Map` — see [Internals](#internals).
 
 Successor to `context-dive` (2018).
 
@@ -124,6 +128,15 @@ link(instance: object, identifier: unknown): void;
 
 Link an instance to an identifier for later retrieval.
 
+### `unlink(identifier)`
+
+```typescript
+unlink(identifier: unknown): void;
+```
+
+Remove an identifier link. Call this when the identifier is done (e.g. on
+request completion) to avoid leaking entries in the strong identifier `Map`.
+
 ### `attachHooks(collection)`
 
 ```typescript
@@ -180,11 +193,12 @@ Reset for testing.
 
 ## Stress Test
 
-The stress test proves context survival across random async boundaries:
+A stress scenario proves context survival across random async boundaries. It
+is a test fixture (`test/stress/`), not a published entry point — run it with
+`npm test` or read it as a worked example.
 
 ```typescript
-import { runStressTest } from '@mnemonica/dive/stress';
-
+// test/stress/runner.ts
 const result = await runStressTest(100, 0.7, 30000);
 // result.report.total     → number of failures
 // result.report.byType    → { 'sync-throw': 10, 'unhandled-rejection': 2, ... }
@@ -204,34 +218,14 @@ even though instances were shuffled, queued, and processed minutes later.
 
 ---
 
-## Framework Adapters
+## Framework Integration
 
-Embedded but independent. Not exported from main module.
-
-### NestJS
-
-```typescript
-import { createDiveExceptionFilter } from '@mnemonica/dive/adapters/nestjs';
-
-@UseFilters(createDiveExceptionFilter())
-export class MyController {}
-```
-
-### Fastify
-
-```typescript
-import { createDivePlugin } from '@mnemonica/dive/adapters/fastify';
-
-app.register(createDivePlugin());
-```
-
-### Express
-
-```typescript
-import { createDiveMiddleware } from '@mnemonica/dive/adapters/express';
-
-app.use(createDiveMiddleware());
-```
+There are no framework-specific adapters. Activation is one line — call
+`attachHooks(defaultTypes)` once at startup, and every mnemonica instance
+created while serving a request becomes context automatically (the instance
+**is** the context). To recover context at a request boundary by a bare
+identifier (e.g. a request id), `link()` the instance to that identifier and
+read it back with `getLastContext(identifier)`.
 
 ---
 
@@ -248,14 +242,121 @@ app.use(createDiveMiddleware());
 
 ---
 
+## Intentionally Not Covered
+
+Dive wraps **direct function calls, constructors, Promise chains, and instance methods**. It does NOT auto-wrap every possible execution boundary. Here is why.
+
+### What We Do NOT Track
+
+| Boundary | Status | Reason |
+|----------|--------|--------|
+| Arrays / objects containing functions | **Use `wrap()`** | Deep inspection causes false positives (every object method would be wrapped) |
+| `setTimeout` / `setInterval` | **Use `wrap()`** | Timer monkey-patching breaks user code and third-party libraries |
+| Event emitters (`on`, `once`) | **Use `wrap()`** | Would need to patch Node.js EventEmitter prototype — fragile |
+| Streams (`pipe`, `on('data')`) | **Use `wrap()`** | Same as emitters; also streams often live longer than context |
+| Property getters / setters | **Not supported** | `wrapInstanceMethods` only handles `descriptor.value`, not accessors |
+| Generators / `yield` | **Use `wrap()`** | Each `yield` creates a suspension point; auto-wrapping requires intercepting `next()` |
+
+### Why Not Auto-Wrap Everything?
+
+Auto-wrapping every boundary causes a **cyclomatic / combinatory explosion**:
+
+```
+Function return → wrap?
+  ├─ function → YES
+  ├─ Promise → unwrap .then() → check resolved value
+  │   ├─ function → YES
+  │   ├─ Promise → recurse
+  │   ├─ Array → iterate → check each element
+  │   │   ├─ function → YES
+  │   │   ├─ object → inspect keys → ...
+  │   └─ object → inspect keys → ...
+  ├─ Array → iterate → check each element → ...
+  └─ object → inspect keys → ...
+```
+
+This is not just performance overhead — it is **correctness overhead**. Deep auto-wrapping:
+- Wraps user-intentional plain objects (false positives)
+- Breaks library code that expects unwrapped references
+- Creates memory leaks if we hold strong refs to every returned object
+
+### Manual Wrapping Is the Escape Hatch
+
+For any boundary not auto-wrapped, use `wrap()` explicitly:
+
+```typescript
+// Arrays containing callbacks
+const handlers = [fn1, fn2, fn3];
+const wrappedHandlers = handlers.map(fn => wrap(fn, instance));
+
+// setTimeout
+setTimeout(wrap(() => processTask(), instance), 1000);
+
+// Event emitters
+emitter.on('data', wrap(onData, instance));
+```
+
+### Generators and `yield`
+
+Generators create a **suspension boundary** at every `yield`. Dive does not auto-wrap them because `yield` can fire across arbitrary async boundaries. Manually wrap the generator function:
+
+```typescript
+function* myGenerator() {
+  const ctx = getLastContext();
+  yield step1(ctx);
+  yield step2(ctx);
+}
+
+// Wrap the generator instantiation
+const wrappedGen = wrap(() => myGenerator(), instance);
+const gen = wrappedGen();
+
+// Each .next() runs in the captured context
+const result1 = gen.next(); // step1 runs with instance as context
+const result2 = gen.next(); // step2 runs with instance as context
+```
+
+For async generators, wrap the async generator function the same way — the `async` keyword does not change the wrapping semantics.
+
+### The Rule of Thumb
+
+> If the execution flow **passes through a function call**, Dive can track it.
+> If the flow **escapes through a non-function boundary** (array slot, event emitter, stream), use `wrap()` manually.
+
+This keeps Dive predictable, fast, and correct.
+
+---
+
 ## History
 
 - **2018:** `context-dive` — `async_hooks` + manual callback patching
 - **2020:** `AsyncLocalStorage` — native Node.js, 90% coverage
-- **2025:** `@mnemonica/dive` — WeakMap + instance-bound context, no ALS
+- **2025:** `@mnemonica/dive` — object-bound context, no ALS
 
 Motivation: [nodejs/diagnostics#249](https://github.com/nodejs/diagnostics/issues/249) —
 synchronous execution splits break `async_hooks`-based CLS.
+
+---
+
+## Internals
+
+The store is three parts (no `async_hooks`):
+
+- `lastContext` — a single module-global holding the most recent context. It is
+  newest-wins and is clobbered by concurrent flows unless you capture per-flow
+  context with `wrap()` / `runWithInstance()`.
+- a `WeakMap` for **object identifiers** — `link(instance, requestObject)` keys
+  by the object and is collected together with it, so there is no leak and no
+  cleanup needed. This is how you pin context to a request boundary: key by the
+  request object.
+- a strong `Map` for **primitive identifiers** — `link(instance, 'uuid')` keys
+  by a primitive, which cannot be a `WeakMap` key. These are held strongly until
+  removed with `unlink()`; long-lived processes that `link()` primitives without
+  `unlink()` will leak.
+
+Context also rides on **error objects** (`enrichError` / `getErrorInstance`) via a
+non-enumerable symbol property, which is how it survives to `uncaughtException` /
+`unhandledRejection` handlers where ALS's ambient store is already gone.
 
 ---
 

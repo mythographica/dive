@@ -1,7 +1,7 @@
 {
 	"name": "@mnemonica/dive",
 	"version": "0.1.0",
-	"description": "Context propagation for mnemonica instances — WeakMap-based, no ALS",
+	"description": "Context propagation for mnemonica instances — object-bound, no ALS",
 	"type": "module",
 	"main": "./build/index.js",
 	"types": "./build/index.d.ts",
@@ -9,18 +9,6 @@
 		".": {
 			"types": "./build/index.d.ts",
 			"default": "./build/index.js"
-		},
-		"./adapters/nestjs": {
-			"types": "./build/adapters/nestjs.d.ts",
-			"default": "./build/adapters/nestjs.js"
-		},
-		"./adapters/fastify": {
-			"types": "./build/adapters/fastify.d.ts",
-			"default": "./build/adapters/fastify.js"
-		},
-		"./adapters/express": {
-			"types": "./build/adapters/express.d.ts",
-			"default": "./build/adapters/express.js"
 		}
 	},
 	"files": [
@@ -31,11 +19,13 @@
 	"scripts": {
 		"build": "tsc",
 		"build:watch": "tsc --watch",
+		"pretest": "tsc",
 		"test": "vitest run",
-		"test:watch": "vitest"
+		"test:watch": "vitest",
+		"prepublishOnly": "tsc"
 	},
 	"peerDependencies": {
-		"mnemonica": "^0.9.0"
+		"mnemonica": "^1.0.0"
 	},
 	"devDependencies": {
 		"@types/node": "^22.0.0",

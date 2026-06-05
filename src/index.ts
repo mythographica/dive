@@ -1,13 +1,16 @@
 /**
  * @mnemonica/dive — Context propagation for mnemonica instances.
  *
- * WeakMap-based store. No AsyncLocalStorage.
+ * Object-bound context. No AsyncLocalStorage, no async_hooks.
+ * Store = a module-global `lastContext` + a `WeakMap` for object identifiers
+ * (auto-collected) + a strong `Map` for primitive identifiers (use unlink()).
  * Successor to context-dive (2018).
  *
  * API:
  *   dive.getLastContext()          → most recent instance
  *   dive.getLastContext(identifier) → instance linked to identifier
  *   dive.link(instance, identifier) → link instance to identifier
+ *   dive.unlink(identifier)         → remove a link (prevents Map leaks)
  *   dive.attachHooks(collection)    → wire into mnemonica hooks
  *   dive.wrap(fn, context?)         → wrap function with current or given context
  *   dive.wrapArgs(args, context?)   → auto-wrap function arguments
@@ -19,7 +22,16 @@
 const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');
 const SymbolDiveWrapped = Symbol.for('mnemonica.dive.wrapped');
 
-const identifierMap = new Map<unknown, object>();
+// Object identifiers are held WEAKLY, so a link keyed by a request/instance
+// object never keeps that object alive and is collected with it — no cleanup
+// needed. Primitive identifiers (uuids, strings) can't be WeakMap keys, so they
+// live in a strong Map and must be removed with unlink() when done.
+const objectMap = new WeakMap<object, object>();
+const primitiveMap = new Map<unknown, object>();
+
+function isObjectKey (identifier: unknown): identifier is object {
+	return identifier !== null && (typeof identifier === 'object' || typeof identifier === 'function');
+}
 
 let lastContext: object | undefined;
 
@@ -32,14 +44,31 @@ export function getLastContext (identifier?: unknown): object | undefined {
 	if (identifier === undefined) {
 		return lastContext;
 	}
-	return identifierMap.get(identifier);
+	return isObjectKey(identifier) ? objectMap.get(identifier) : primitiveMap.get(identifier);
 }
 
 /**
- * Link an instance to an identifier for later retrieval.
+ * Link an instance to an identifier for later retrieval. Object identifiers are
+ * held weakly (no leak); primitive identifiers are held strongly (use unlink).
  */
 export function link (instance: object, identifier: unknown): void {
-	identifierMap.set(identifier, instance);
+	if (isObjectKey(identifier)) {
+		objectMap.set(identifier, instance);
+	} else {
+		primitiveMap.set(identifier, instance);
+	}
+}
+
+/**
+ * Remove an identifier link. Required for PRIMITIVE identifiers (strong Map) to
+ * avoid leaks; harmless for object identifiers (already weak / auto-collected).
+ */
+export function unlink (identifier: unknown): void {
+	if (isObjectKey(identifier)) {
+		objectMap.delete(identifier);
+	} else {
+		primitiveMap.delete(identifier);
+	}
 }
 
 /**
@@ -59,6 +88,11 @@ function isWrappedFunction (value: unknown): boolean {
 /**
  * Wrap a function so it restores dive context on invocation.
  * If no context is provided, captures the current lastContext.
+ *
+ * Handles:
+ *   - `new` calls via Reflect.construct
+ *   - Returned functions are wrapped to propagate context
+ *   - Promise resolutions are wrapped if they resolve to functions
  */
 export function wrap<T extends (...args: unknown[]) => unknown> (
 	fn: T,
@@ -74,11 +108,43 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 		const previousContext = lastContext;
 		lastContext = capturedContext;
 		try {
-			return fn.apply(this, args);
+			const isConstructor = new.target !== undefined;
+
+			let result: unknown;
+			if (isConstructor) {
+				result = Reflect.construct(
+					fn as unknown as new (...args: unknown[]) => unknown,
+					args,
+					new.target
+				);
+			} else {
+				result = fn.apply(this, args);
+			}
+
+			// Wrap returned functions so they carry the context forward
+			if (typeof result === 'function' && !isWrappedFunction(result)) {
+				result = wrap(result as (...args: unknown[]) => unknown, capturedContext);
+			}
+
+			// If Promise, wrap resolved value if it's a function
+			if (result instanceof Promise) {
+				return result.then((resolved: unknown) => {
+					if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
+						return wrap(resolved as (...args: unknown[]) => unknown, capturedContext);
+					}
+					return resolved;
+				});
+			}
+
+			return result;
 		} finally {
 			lastContext = previousContext;
 		}
 	} as T;
+
+	// Preserve prototype for constructor wrapping
+	Object.setPrototypeOf(wrapped, fn);
+	wrapped.prototype = fn.prototype;
 
 	Object.defineProperty(wrapped, 'name', {
 		value        : `diveWrapped:${(fn as { name?: string }).name}`,
@@ -110,8 +176,16 @@ export function wrapArgs (
 }
 
 /**
- * Wrap all user-defined prototype methods on an instance so that
- * they run with the instance as the active dive context.
+ * Wrap user-defined methods so they run with the receiving instance as the
+ * active dive context.
+ *
+ * Wrapping is applied to the instance's immediate PROTOTYPE (not the instance
+ * itself), using `this` (the receiver) as the context. For plain classes —
+ * where many instances share one prototype — this wraps each method ONCE
+ * instead of once per instance. NOTE: mnemonica gives every instance its own
+ * immediate prototype, so for mnemonica instances this is still per-instance
+ * (no shared prototype exists to wrap once); it is not worse, just not a win.
+ * See README "Internals".
  *
  * Wrapped methods also:
  *   - wrap function arguments to propagate context
@@ -137,36 +211,55 @@ export function wrapInstanceMethods (instance: object): void {
 		if (isWrappedFunction(descriptor.value)) {
 			continue;
 		}
+		// Only a configurable method can be safely redefined on the prototype.
+		if (descriptor.configurable === false) {
+			continue;
+		}
 
 		const fn = descriptor.value as (...args: unknown[]) => unknown;
 
-		Object.defineProperty(instance, name, {
-			value (...args: unknown[]) {
-				const previousContext = lastContext;
-				lastContext = instance;
-				try {
-					const wrappedArgs = wrapArgs(args, instance);
-					let result = fn.apply(this, wrappedArgs);
+		const wrappedMethod = function (this: object, ...args: unknown[]) {
+			const context = this;
+			const previousContext = lastContext;
+			lastContext = context;
+			try {
+				const wrappedArgs = wrapArgs(args, context);
+				let result = fn.apply(this, wrappedArgs);
 
-					if (typeof result === 'function' && !isWrappedFunction(result)) {
-						result = wrap(result as (...args: unknown[]) => unknown, instance);
-					}
-
-					if (result instanceof Promise) {
-						result = result.catch((error: Error) => {
-							enrichError(error, instance);
-							throw error;
-						});
-					}
-
-					return result;
-				} catch (error: unknown) {
-					enrichError(error as Error, instance);
-					throw error;
-				} finally {
-					lastContext = previousContext;
+				if (typeof result === 'function' && !isWrappedFunction(result)) {
+					result = wrap(result as (...args: unknown[]) => unknown, context);
 				}
-			},
+
+				if (result instanceof Promise) {
+					result = result.then((resolved: unknown) => {
+						if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
+							return wrap(resolved as (...args: unknown[]) => unknown, context);
+						}
+						return resolved;
+					}).catch((error: Error) => {
+						enrichError(error, context);
+						throw error;
+					});
+				}
+
+				return result;
+			} catch (error: unknown) {
+				enrichError(error as Error, context);
+				throw error;
+			} finally {
+				lastContext = previousContext;
+			}
+		};
+
+		// Mark so a shared prototype is not re-wrapped by the next instance.
+		Object.defineProperty(wrappedMethod, SymbolDiveWrapped, {
+			value        : true,
+			configurable : false,
+			enumerable   : false,
+		});
+
+		Object.defineProperty(proto, name, {
+			value        : wrappedMethod,
 			writable     : true,
 			configurable : true,
 			enumerable   : false,

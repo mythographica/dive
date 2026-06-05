@@ -9,6 +9,7 @@ import {
 	getLastContext,
 	setLastContext,
 	link,
+	unlink,
 	wrap,
 	wrapArgs,
 	wrapInstanceMethods,
@@ -80,6 +81,21 @@ describe('dive identifier linking', () => {
 		expect(getLastContext('ida')).toBe(a);
 		expect(getLastContext('idb')).toBe(b);
 	});
+
+	it('supports both object identifiers (WeakMap) and primitive ones (Map)', () => {
+		const instance = { name: 'test' };
+		const objKey = { kind: 'request' };
+
+		link(instance, objKey);   // routed to the WeakMap
+		link(instance, 'uuid-1'); // routed to the strong Map
+		expect(getLastContext(objKey)).toBe(instance);
+		expect(getLastContext('uuid-1')).toBe(instance);
+
+		unlink(objKey);
+		unlink('uuid-1');
+		expect(getLastContext(objKey)).toBeUndefined();
+		expect(getLastContext('uuid-1')).toBeUndefined();
+	});
 });
 
 describe('dive wrap', () => {
@@ -138,6 +154,181 @@ describe('dive wrap', () => {
 		const ctx = { id: 'explicit' };
 		const fn = wrap(() => getLastContext(), ctx);
 		expect(fn()).toBe(ctx);
+	});
+
+	it('wrap preserves constructor calls with new', () => {
+		const ctx = { id: 'ctor' };
+		setLastContext(ctx);
+
+		class MyClass {
+			value: number;
+			constructor () {
+				this.value = 42;
+			}
+			getContext () {
+				return getLastContext();
+			}
+		}
+
+		const WrappedClass = wrap(MyClass as unknown as (...args: unknown[]) => unknown);
+		const instance = new (WrappedClass as unknown as new () => MyClass)();
+
+		expect(instance.value).toBe(42);
+		expect(instance).toBeInstanceOf(MyClass);
+		expect(instance.getContext()).toBe(ctx);
+	});
+
+	it('wrap wraps returned functions', () => {
+		const ctx = { id: 'return-fn' };
+		setLastContext(ctx);
+
+		const fn = wrap(() => {
+			return () => getLastContext();
+		});
+
+		clear();
+		const returnedFn = fn() as () => object | undefined;
+		expect(returnedFn()).toBe(ctx);
+	});
+
+	it('wrap wraps Promise-resolved functions', async () => {
+		const ctx = { id: 'promise-fn' };
+		setLastContext(ctx);
+
+		const fn = wrap(() => {
+			return Promise.resolve(() => getLastContext());
+		});
+
+		clear();
+		const resolvedFn = await fn() as () => object | undefined;
+		expect(resolvedFn()).toBe(ctx);
+	});
+
+	it('wrap does not wrap non-function return values', () => {
+		const fn = wrap(() => ({ value: 42 }));
+		expect(fn()).toEqual({ value: 42 });
+	});
+
+	it('wrap restores context even when function throws', () => {
+		const prev = { id: 'prev' };
+		setLastContext(prev);
+
+		const fn = wrap(() => {
+			throw new Error('boom');
+		});
+
+		expect(() => fn()).toThrow('boom');
+		expect(getLastContext()).toBe(prev);
+	});
+
+	it('wrap restores context even when constructor throws', () => {
+		const prev = { id: 'prev' };
+		setLastContext(prev);
+
+		class BadClass {
+			constructor () {
+				throw new Error('intentional');
+			}
+		}
+
+		const WrappedClass = wrap(BadClass as unknown as (...args: unknown[]) => unknown);
+		expect(() => new (WrappedClass as unknown as new () => unknown)()).toThrow('intentional');
+		expect(getLastContext()).toBe(prev);
+	});
+
+	it('wrap wraps nested returned functions', () => {
+		const ctx = { id: 'nested' };
+		setLastContext(ctx);
+
+		const fn = wrap(() => {
+			return () => {
+				return () => getLastContext();
+			};
+		});
+
+		clear();
+		const level1 = fn() as () => unknown;
+		const level2 = level1() as () => object | undefined;
+		expect(level2()).toBe(ctx);
+	});
+
+	it('wrap does not double-wrap returned functions', () => {
+		const ctx = { id: 'no-double' };
+		setLastContext(ctx);
+
+		const inner = wrap(() => getLastContext());
+		const fn = wrap(() => inner);
+
+		clear();
+		const returned = fn() as () => object | undefined;
+		expect(returned()).toBe(ctx);
+		// Should be the same reference, not re-wrapped
+		expect(returned).toBe(inner);
+	});
+
+	it('wrap wraps Promise-resolved non-function values unchanged', async () => {
+		const fn = wrap(() => Promise.resolve({ value: 123 }));
+		const result = await fn();
+		expect(result).toEqual({ value: 123 });
+	});
+
+	it('wrap handles rejected promises without losing context', async () => {
+		const prev = { id: 'prev' };
+		setLastContext(prev);
+
+		const fn = wrap(() => Promise.reject(new Error('async boom')));
+
+		await expect(fn()).rejects.toThrow('async boom');
+		expect(getLastContext()).toBe(prev);
+	});
+});
+
+describe('dive generator wrapping', () => {
+	beforeEach(() => {
+		clear();
+	});
+
+	it('wrap on generator factory sets context during creation only', () => {
+		const ctx = { id: 'gen' };
+		setLastContext(ctx);
+
+		function* myGenerator() {
+			yield getLastContext();
+		}
+
+		const wrappedFactory = wrap(() => myGenerator());
+		clear();
+
+		const gen = wrappedFactory() as Generator<object | undefined>;
+		// Generator body starts at first next(), but context was already restored
+		const step1 = gen.next();
+		expect(step1.value).toBeUndefined();
+	});
+
+	it('manual wrapping for generator body using wrap on each next', () => {
+		const ctx = { id: 'gen-manual' };
+		setLastContext(ctx);
+
+		function* myGenerator() {
+			yield getLastContext();
+			yield getLastContext();
+		}
+
+		const gen = myGenerator();
+		clear();
+
+		// Wrap each next() call explicitly
+		const step1 = wrap(() => gen.next(), ctx)();
+		expect(step1.value).toBe(ctx);
+		expect(step1.done).toBe(false);
+
+		const step2 = wrap(() => gen.next(), ctx)();
+		expect(step2.value).toBe(ctx);
+		expect(step2.done).toBe(false);
+
+		// Generator exhausted
+		const step3 = wrap(() => gen.next(), ctx)();
+		expect(step3.done).toBe(true);
 	});
 });
 
@@ -238,6 +429,21 @@ describe('dive wrapInstanceMethods', () => {
 		expect(returnedFn()).toBe(instance);
 	});
 
+	it('wraps Promise-resolved functions from methods', async () => {
+		class MyClass {
+			async getAsyncFn () {
+				return () => getLastContext();
+			}
+		}
+
+		const instance = new MyClass();
+		wrapInstanceMethods(instance);
+		clear();
+
+		const resolvedFn = await instance.getAsyncFn() as () => object | undefined;
+		expect(resolvedFn()).toBe(instance);
+	});
+
 	it('enriches thrown errors with the instance', () => {
 		class MyClass {
 			throwError () {
@@ -278,6 +484,26 @@ describe('dive wrapInstanceMethods', () => {
 		const instance = { toString: () => 'custom' };
 		wrapInstanceMethods(instance);
 		expect(instance.toString()).toBe('custom');
+	});
+
+	it('wraps a shared prototype ONCE across instances; context follows `this`', () => {
+		clear();
+		class Shared {
+			getCtx () { return getLastContext(); }
+		}
+		const a = new Shared();
+		const b = new Shared();
+
+		wrapInstanceMethods(a);
+		const wrappedA = Object.getPrototypeOf(a).getCtx;
+		wrapInstanceMethods(b); // no-op: prototype method already wrapped
+		const wrappedB = Object.getPrototypeOf(b).getCtx;
+
+		// same wrapped function reference -> wrapped once, not per instance
+		expect(wrappedA).toBe(wrappedB);
+		// context is the receiver, so each instance gets ITS OWN context
+		expect(a.getCtx()).toBe(a);
+		expect(b.getCtx()).toBe(b);
 	});
 });
 

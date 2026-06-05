@@ -7,7 +7,7 @@
  *   - rejects async
  *   - attempts nested construction
  */
-import { enrichError } from '../index.js';
+import { enrichError } from '../../src/index.js';
 import { pickRandom, registrySize } from './registry.js';
 import { pushToDlq } from './dlq.js';
 

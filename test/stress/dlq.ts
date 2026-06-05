@@ -4,7 +4,7 @@
  * Collects failed instances from uncaughtException and unhandledRejection.
  * Produces a comprehensive report when threshold is reached.
  */
-import { getLastContext } from '../index.js';
+import { getLastContext } from '../../src/index.js';
 import { getProps } from 'mnemonica';
 
 export type ErrorType = 'sync-throw' | 'unhandled-rejection' | 'creation-error';

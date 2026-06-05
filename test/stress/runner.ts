@@ -5,7 +5,7 @@
  * or any other execution boundary. Returns a promise that resolves with
  * the DLQ report after the queue has processed all registered instances.
  */
-import { link } from '../index.js';
+import { link } from '../../src/index.js';
 import { StressEntity } from './types.js';
 import { registerInstances, clearRegistry } from './registry.js';
 import { clearDlq, produceReport } from './dlq.js';

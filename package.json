@@ -1,6 +1,6 @@
 {
 	"name": "@mnemonica/dive",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Context propagation for mnemonica instances — object-bound, no ALS",
 	"type": "module",
 	"main": "./build/index.js",
@@ -21,6 +21,7 @@
 		"build:watch": "tsc --watch",
 		"pretest": "tsc",
 		"test": "vitest run",
+		"test:cov": "vitest run --coverage",
 		"test:watch": "vitest",
 		"prepublishOnly": "tsc"
 	},
@@ -29,6 +30,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^22.0.0",
+		"@vitest/coverage-v8": "^2.1.9",
 		"mnemonica": "file:../core",
 		"typescript": "^5.5.0",
 		"vitest": "^2.0.0"

@@ -5,6 +5,7 @@
  * auto-wraps instance methods via the postCreation hook.
  */
 import { defaultTypes } from 'mnemonica/module';
+import { attachHooks } from '../../src/index.js';
 
 export interface StressData {
 	uuid      : string;
@@ -32,3 +33,7 @@ export const StressChild: any = StressEntity.define('StressChild', function (
 	}
 	this.childData = data;
 });
+
+// Dive lifecycle wiring for the stress types — attached ONCE at module load.
+// clear() between tests resets the trace; hook registrations stay.
+attachHooks(defaultTypes);

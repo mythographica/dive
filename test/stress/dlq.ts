@@ -1,21 +1,22 @@
 /**
  * Dead Letter Queue for the dive stress test.
  *
- * Collects failed instances from uncaughtException and unhandledRejection.
+ * Collects failures. Every entry is derived FROM THE ERROR ITSELF:
+ * the origin instance (getErrorInstance) and the execution branch that
+ * produced the failure (getFlow) — no side maps, no manual linking.
  * Produces a comprehensive report when threshold is reached.
  */
-import { getLastContext } from '../../src/index.js';
-import { getProps } from 'mnemonica';
+import { getErrorInstance, getFlow } from '../../src/index.js';
 
 export type ErrorType = 'sync-throw' | 'unhandled-rejection' | 'creation-error';
 
 export interface FailedInstance {
 	requestId   : string;
 	uuid        : string;
-	instance    : object;
+	instance    : object | undefined;
 	errorType   : ErrorType;
 	timestamp   : number;
-	diveContext : string | null;
+	flowLength  : number;
 }
 
 const DLQ : FailedInstance[] = [];
@@ -30,21 +31,6 @@ export function clearDlq () : void {
 
 export function getDlqEntries () : readonly FailedInstance[] {
 	return DLQ;
-}
-
-function getInstanceTypeName (instance : object) : string {
-	try {
-		const p = getProps(instance);
-		return p?.__type__?.TypeName ?? 'unknown';
-	} catch {
-		return 'unknown';
-	}
-}
-
-function getDiveContextName () : string | null {
-	const ctx = getLastContext();
-	if (!ctx) return null;
-	return getInstanceTypeName(ctx);
 }
 
 export interface DlqReport {
@@ -76,17 +62,19 @@ export function produceReport () : DlqReport {
 }
 
 export function pushToDlq (params: {
-	requestId : string;
-	uuid      : string;
-	instance  : object;
+	error     : Error;
 	errorType : ErrorType;
 }) : void {
+	// The Goal: the error carries the data and the flow. Everything the DLQ
+	// needs is recovered off the error object — requestId and uuid live in
+	// the instance's own data, the branch length proves the trace survived.
+	const instance = getErrorInstance(params.error) as Record<string, unknown> | undefined;
 	DLQ.push({
-		requestId   : params.requestId,
-		uuid        : params.uuid,
-		instance    : params.instance,
-		errorType   : params.errorType,
-		timestamp   : Date.now(),
-		diveContext : getDiveContextName(),
+		requestId  : String(instance?.requestId ?? 'unknown'),
+		uuid       : String(instance?.uuid ?? 'unknown'),
+		instance,
+		errorType  : params.errorType,
+		timestamp  : Date.now(),
+		flowLength : getFlow(params.error).length,
 	});
 }

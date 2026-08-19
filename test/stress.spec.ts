@@ -5,27 +5,24 @@
  *   - random async scheduling
  *   - multiple instance creations
  *   - setTimeout / setInterval boundaries
- *   - uncaughtException and unhandledRejection
+ *   - sync throws, unhandled rejections, failed nested constructions
  *
  * ALS would lose all context because each timer is a different async resource.
+ * Every DLQ entry must carry BOTH the origin's data (requestId/uuid recovered
+ * off the error) AND a non-empty flow trace.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTypesCollection } from 'mnemonica/module';
-import type { TypesCollection } from 'mnemonica/module';
-import { attachHooks, clear } from '../src/index.js';
+import { clear } from '../src/index.js';
 import { runStressTest } from './stress/runner.js';
 import { clearRegistry } from './stress/registry.js';
-import { clearDlq } from './stress/dlq.js';
+import { clearDlq, getDlqEntries } from './stress/dlq.js';
 
 describe('dive stress test', () => {
-	let collection: TypesCollection;
-
 	beforeEach(() => {
+		// hooks are attached once in stress/types.ts (module load)
 		clear();
 		clearRegistry();
 		clearDlq();
-		collection = createTypesCollection();
-		attachHooks(collection);
 	});
 
 	it('preserves instance context through random async queue', async () => {
@@ -43,6 +40,13 @@ describe('dive stress test', () => {
 
 		// Error types must be present
 		expect(Object.keys(result.report.byType).length).toBeGreaterThan(0);
+
+		// The Goal, per entry: origin data AND a non-empty flow trace
+		for (const entry of getDlqEntries()) {
+			expect(entry.requestId).toBe(result.requestId);
+			expect(entry.instance).toBeDefined();
+			expect(entry.flowLength).toBeGreaterThan(0);
+		}
 	}, 15000);
 
 	it('links all failures to originating request', async () => {

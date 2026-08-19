@@ -4,8 +4,10 @@
  * Abstracted entry point — can be called from a vitest test, a controller,
  * or any other execution boundary. Returns a promise that resolves with
  * the DLQ report after the queue has processed all registered instances.
+ *
+ * Instances carry their identity in their own data (uuid, requestId) — no
+ * side maps. Failures recover the origin off the error object itself.
  */
-import { link } from '../../src/index.js';
 import { StressEntity } from './types.js';
 import { registerInstances, clearRegistry } from './registry.js';
 import { clearDlq, produceReport } from './dlq.js';
@@ -47,8 +49,6 @@ export async function runStressTest (
 			requestId,
 			value: Math.random() > 0.5 ? Math.floor(Math.random() * 100) : 'string-value',
 		});
-		link(instance, uuid);
-		link(instance, requestId);
 		instances.push(instance);
 	}
 

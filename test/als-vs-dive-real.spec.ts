@@ -1,32 +1,25 @@
 /**
  * REAL head-to-head: ALS vs dive — honest in BOTH directions.
  *
- * Unlike als-comparison.spec.ts (whose assertions are tautological or mislabel
- * ALS *working* as ALS failing), these tests reproduce the actual mechanics and
- * encode what was observed — including the case where ALS WINS. The point is
- * truth, not advocacy.
- *
- * Fixtures are kept SYMMETRIC: both arms are given the same information at
- * consume time (only a bare uuid string). Asymmetric fixtures — handing one
- * side richer data — are exactly how the original suite faked its results.
+ * These tests reproduce the actual mechanics and encode what was observed —
+ * including the case where ALS WINS. The point is truth, not advocacy.
  *
  * Mechanism summary:
  *   - ALS keys context by ASYNC RESOURCE  -> dies when the request scope exits.
- *   - dive keys context by USERLAND OBJECT (link map / object reference)
- *     -> survives, because the object outlives the async resource.
- *   - dive's bare `lastContext` is a single module-global -> clobbered by
- *     concurrent flows UNLESS you capture per-flow context with wrap().
+ *   - dive keys context by USERLAND OBJECT -> survives, because the object
+ *     outlives the async resource. In the redesigned dive there is not even a
+ *     lookup map: the failing data IS pinned to the error, with its flow trace.
+ *   - dive's bare current() is a single module-global switcher -> newest-wins
+ *     under interleaving. The TRACE (getFlow) is what isolates concurrent
+ *     flows; current() is a convenience for single-flow code.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { getLastContext, setLastContext, link, wrap, clear } from '../src/index.js';
+import { createTypesCollection } from 'mnemonica/module';
+import { attachHooks, wrap, current, getErrorInstance, getFlow, clear } from '../src/index.js';
 
-describe('decoupled queue: recover origin from a BARE identifier', () => {
+describe('decoupled queue: recover origin after the request ends', () => {
 	beforeEach(() => clear());
-
-	// Both arms enqueue ONLY the uuid string — as if it were a uuid in a log
-	// line or a DB row, with the originating object long out of scope. This is
-	// the realistic case and keeps the comparison fair.
 
 	it('ALS cannot map a bare uuid back to its origin after the request ends', async () => {
 		const als = new AsyncLocalStorage<{ requestId: string }>();
@@ -50,23 +43,29 @@ describe('decoupled queue: recover origin from a BARE identifier', () => {
 		expect(recovered).toEqual([undefined, undefined, undefined, undefined, undefined]);
 	});
 
-	it('dive maps a bare uuid back to its origin via the link map', async () => {
-		const queue: string[] = [];
-		const requestId = 'req-A';
+	it('dive recovers the origin from the ERROR itself — no identifier map needed', async () => {
+		// The old dive mapped bare uuids through a side map (link/unlink), with a
+		// leak caveat. The redesign answers the Goal directly: when the consumer
+		// FAILS, the data that caused it is pinned to the error, with its flow.
+		const queue: { uuid: string; requestId: string; payload: number }[] = [];
 
 		for (let i = 0; i < 5; i++) {
-			const uuid = `${requestId}-${i}`;
-			const instance = { uuid, requestId, payload: i };
-			link(instance, uuid); // pin object to identifier
-			queue.push(uuid);      // enqueue ONLY the uuid; object goes out of scope
+			queue.push({ uuid: `req-A-${i}`, requestId: 'req-A', payload: i });
 		}
 
 		const recovered: (string | undefined)[] = [];
 		await new Promise<void>((resolve) => setTimeout(() => {
-			for (const uuid of queue) {
-				// consumer holds only the uuid — recovers the object via the map
-				const ctx = getLastContext(uuid) as { requestId: string } | undefined;
-				recovered.push(ctx?.requestId);
+			for (const instance of queue) {
+				try {
+					// the consumer processes each instance at a decoupled boundary…
+					wrap(() => {
+						throw new Error(`processing failed: ${instance.uuid}`);
+					}, instance)();
+				} catch (err) {
+					// …and the failure itself carries the origin — no map, no uuid lookup
+					const origin = getErrorInstance(err as Error) as { requestId: string } | undefined;
+					recovered.push(origin?.requestId);
+				}
 			}
 			resolve();
 		}, 5));
@@ -75,7 +74,7 @@ describe('decoupled queue: recover origin from a BARE identifier', () => {
 	});
 });
 
-describe('concurrent flows: ALS auto-isolates; dive needs wrap()', () => {
+describe('concurrent flows: ALS auto-isolates; the dive TRACE isolates', () => {
 	beforeEach(() => clear());
 
 	it('ALS isolates two interleaved async flows automatically', async () => {
@@ -96,50 +95,43 @@ describe('concurrent flows: ALS auto-isolates; dive needs wrap()', () => {
 		expect(out).toEqual({ A: 'A', B: 'B' });
 	});
 
-	it("dive's bare global lastContext IS clobbered by interleaving (no wrap)", async () => {
-		const out: Record<string, unknown> = {};
+	it("dive's bare current() IS newest-wins under interleaving (documented)", async () => {
+		const collection = createTypesCollection();
+		attachHooks(collection);
+		const Entity = collection.define('Entity', function (this: { id: string }, id: string) {
+			this.id = id;
+		});
 
-		await Promise.all([
-			(async () => {
-				setLastContext({ id: 'A' });
-				await new Promise((r) => setTimeout(r, 15));
-				out.A = (getLastContext() as { id: string } | undefined)?.id;
-			})(),
-			(async () => {
-				setLastContext({ id: 'B' });
-				await new Promise((r) => setTimeout(r, 5));
-				out.B = (getLastContext() as { id: string } | undefined)?.id;
-			})(),
-		]);
+		new Entity('A');
+		const b = new Entity('B');
 
-		// Both reads see the LAST writer's value: the single module-global cannot
-		// isolate concurrent flows on its own. This is dive's real limitation.
-		expect(out.A).toBe(out.B);
+		// the switcher holds the LAST thing that happened — nothing isolates it
+		expect(current()).toBe(b);
 	});
 
-	it('dive wrap() DOES isolate concurrent flows when captured synchronously', async () => {
+	it('the dive trace isolates interleaved flows structurally', async () => {
 		const out: Record<string, unknown> = {};
+		const a = { id: 'A' };
+		const b = { id: 'B' };
 
 		await Promise.all([
 			(async () => {
-				setLastContext({ id: 'A' });
-				// capture context into the closure synchronously, before any await
-				const cb = wrap(() => (getLastContext() as { id: string } | undefined)?.id);
+				const cb = wrap(() => current(), a);
 				await new Promise((r) => setTimeout(r, 15));
-				out.A = cb();
+				out.A = (cb() as { id: string } | undefined)?.id;
 			})(),
 			(async () => {
-				setLastContext({ id: 'B' });
-				const cb = wrap(() => (getLastContext() as { id: string } | undefined)?.id);
+				const cb = wrap(() => current(), b);
 				await new Promise((r) => setTimeout(r, 5));
-				out.B = cb();
+				out.B = (cb() as { id: string } | undefined)?.id;
 			})(),
 		]);
 
-		// With per-flow wrap(), each closure restores its OWN captured context.
-		// dive matches ALS's isolation here — at the cost of explicit ceremony.
+		// wrap() restores each closure's own capture — and the branches stay apart
 		expect(out.A).toBe('A');
 		expect(out.B).toBe('B');
+		expect(getFlow(a).every((edge) => edge.instance === a)).toBe(true);
+		expect(getFlow(b).every((edge) => edge.instance === b)).toBe(true);
 	});
 });
 
@@ -198,12 +190,12 @@ describe('nodejs/diagnostics#249: callback pushed to a setInterval-drained queue
 				}
 			}, 10);
 
-			// FunctionWhereTrackingStarts: set context, wrap the queued callback
-			setLastContext({ id: 'logical-A' });
+			// FunctionWhereTrackingStarts: wrap the queued callback with the context
+			const logicalContext = { id: 'logical-A' };
 			queue.push(wrap(() => {
-				seen = (getLastContext() as { id: string } | undefined)?.id;
-			}));
-			clear(); // even with global context wiped, the closure kept its capture
+				seen = (current() as { id: string } | undefined)?.id;
+			}, logicalContext));
+			clear(); // even with ambient context wiped, the closure kept its capture
 		});
 
 		expect(result).toBe('logical-A'); // dive bridges the split via the closure

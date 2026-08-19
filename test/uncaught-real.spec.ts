@@ -1,14 +1,15 @@
 /**
- * REAL crash-boundary test (replaces the simulated stress-test claim).
+ * REAL crash-boundary test — the Goal, end to end.
  *
- * The existing stress test runs with noThrow=true and never actually crosses
- * an uncaughtException / unhandledRejection boundary. This test does, in a
- * child process, and compares dive against ALS head-to-head.
+ * uncaughtException and unhandledRejection never know where they came from
+ * or which data caused them. This test crosses both boundaries in a child
+ * process with a decoupled consumer (the case ALS genuinely cannot handle)
+ * and compares dive against ALS head-to-head.
  *
- * Result (observed, then encoded):
- *   - Decoupled consumer fails outside the request's async subtree.
+ * Expected (encoded from observation):
  *   - ALS  -> getStore() is null in the handler (ambient store is gone).
- *   - dive -> getErrorInstance(err) recovers the origin (pinned to the error).
+ *   - dive -> getErrorInstance(err) recovers the ORIGIN INSTANCE, and
+ *             getFlow(err) recovers the branch: create:Entity -> method.
  *
  * NOTE: the child imports the compiled build/ (no TS loader available), so
  * `npm run build` must be current for this test to reflect src changes.
@@ -27,21 +28,27 @@ function runChild (mode: 'throw' | 'reject') {
 		via           : string;
 		alsInHandler  : string | null;
 		diveInHandler : string | null;
+		flowKinds     : string[];
+		flowStatus    : string[];
 	};
 }
 
 describe('REAL crash boundary: dive vs ALS (decoupled consumer)', () => {
-	it('uncaughtException: dive recovers origin from the error; ALS store is gone', () => {
+	it('uncaughtException: dive recovers the data AND the flow; ALS store is gone', () => {
 		const r = runChild('throw');
 		expect(r.via).toBe('uncaughtException');
-		expect(r.diveInHandler).toBe('origin-instance'); // dive: pinned to error object
-		expect(r.alsInHandler).toBeNull();               // ALS: ambient store gone
+		expect(r.alsInHandler).toBeNull(); // ALS: ambient store gone
+		expect(r.diveInHandler).toBe('origin-instance'); // dive: data on the error
+		expect(r.flowKinds).toEqual(['create:Entity', 'method:process']);
+		expect(r.flowStatus).toEqual(['running', 'error']);
 	});
 
-	it('unhandledRejection: dive recovers origin from the error; ALS store is gone', () => {
+	it('unhandledRejection: dive recovers the data AND the flow; ALS store is gone', () => {
 		const r = runChild('reject');
 		expect(r.via).toBe('unhandledRejection');
-		expect(r.diveInHandler).toBe('origin-instance');
 		expect(r.alsInHandler).toBeNull();
+		expect(r.diveInHandler).toBe('origin-instance');
+		expect(r.flowKinds).toEqual(['create:Entity', 'method:processAsync']);
+		expect(r.flowStatus).toEqual(['running', 'error']);
 	});
 });

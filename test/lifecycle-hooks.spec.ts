@@ -22,8 +22,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTypesCollection } from 'mnemonica/module';
 
 import {
-	getLastContext,
 	attachHooks,
+	current,
 	getErrorInstance,
 	clear,
 } from '../src/index.js';
@@ -42,7 +42,7 @@ describe('attachHooks: preCreation enters parent context', () => {
 
 		let seenDuringCtor: unknown;
 		Parent.define('Child', function (this: { kind: string }) {
-			seenDuringCtor = getLastContext(); // set by preCreation, before postCreation
+			seenDuringCtor = current(); // set by preCreation, before postCreation
 			this.kind = 'child';
 		});
 
@@ -50,10 +50,10 @@ describe('attachHooks: preCreation enters parent context', () => {
 		const child = new parent.Child();
 
 		expect(seenDuringCtor).toBe(parent); // preCreation entered the parent
-		expect(getLastContext()).toBe(child); // postCreation then entered the child
+		expect(current()).toBe(child); // postCreation then entered the child
 	});
 
-	it('wraps function args so a constructor callback carries the parent context', () => {
+	it('wraps a function arg, and an UNUSED callback upgrades to the built instance', () => {
 		const collection = createTypesCollection();
 		attachHooks(collection);
 
@@ -64,19 +64,48 @@ describe('attachHooks: preCreation enters parent context', () => {
 
 		let received: (() => unknown) | undefined;
 		Parent.define('Child', function (this: { kind: string }, cb: () => unknown) {
-			received = cb; // the arg AS the constructor receives it
+			received = cb; // STORED, not invoked during construction
 			this.kind = 'child';
 		});
 
 		clear();
-		const original = () => getLastContext();
-		new parent.Child(original);
+		const original = () => current();
+		const child = new parent.Child(original);
 
 		expect(received).toBeTypeOf('function');
 		expect(received).not.toBe(original); // dive-wrapped, not the raw function
 
 		clear(); // even with ambient context wiped…
-		expect(received!()).toBe(parent); // …the closure restores the captured parent
+		// …the callback now resolves to the INSTANCE it belongs to: preCreation
+		// captured the parent, postCreation upgraded it because it was never used.
+		expect(received!()).toBe(child);
+	});
+
+	it('a callback USED during construction stays pinned to the parent', () => {
+		const collection = createTypesCollection();
+		attachHooks(collection);
+
+		const Parent = collection.define('Parent', function (this: { kind: string }) {
+			this.kind = 'parent';
+		});
+		const parent = new Parent();
+
+		let stored: (() => unknown) | undefined;
+		let duringCtor: unknown;
+		Parent.define('Child', function (this: { kind: string }, cb: () => unknown) {
+			duringCtor = cb(); // INVOKED during construction — locks to parent
+			stored = cb;
+			this.kind = 'child';
+		});
+
+		clear();
+		new parent.Child(() => current());
+
+		expect(duringCtor).toBe(parent); // during construction, context is the parent
+
+		clear();
+		// it was used, so postCreation does NOT upgrade it — later calls stay parent
+		expect(stored!()).toBe(parent);
 	});
 });
 
@@ -131,6 +160,6 @@ describe('attachHooks: creationError pins the surviving parent', () => {
 		}
 
 		// the last thing that happened is the error: it becomes the current context
-		expect(getLastContext()).toBe(caught);
+		expect(current()).toBe(caught);
 	});
 });

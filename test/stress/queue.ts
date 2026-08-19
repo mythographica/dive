@@ -6,14 +6,14 @@
  *   - throws sync errors
  *   - rejects async
  *   - attempts nested construction
+ *
+ * Failures are produced INSIDE wrapped boundaries — that is the dive way:
+ * the consumer wraps its processing with the instance it picked, so the
+ * failure is pinned to the data that caused it, with its flow trace.
  */
-import { enrichError } from '../../src/index.js';
+import { wrap } from '../../src/index.js';
 import { pickRandom, registrySize } from './registry.js';
 import { pushToDlq } from './dlq.js';
-
-function randomId () : string {
-	return Math.random().toString(36).slice(2, 10);
-}
 
 /**
  * Start the random consumer. Returns a promise that resolves
@@ -47,40 +47,53 @@ export function startConsumer (options?: {
 			setTimeout(tick, delay);
 
 			const inst = instance as Record<string, unknown>;
-			const uuid = String(inst.uuid || randomId());
-			const requestId = String(inst.requestId || 'unknown');
+			const uuid = String(inst.uuid || 'unknown');
 			const dice = Math.random();
 
 			if (dice < successRate) {
 				// success
 			} else if (dice < 0.72) {
 				const err = new Error(`sync throw: ${uuid}`);
-				enrichError(err, instance);
-				pushToDlq({ requestId, uuid, instance, errorType: 'sync-throw' });
+				try {
+					// processing happens inside the instance's own boundary
+					wrap(() => {
+						throw err;
+					}, instance)();
+				} catch (caught) {
+					pushToDlq({ error: caught as Error, errorType: 'sync-throw' });
+				}
 				if (!noThrow) throw err;
 			} else if (dice < 0.86) {
 				const err = new Error(`async rejection: ${uuid}`);
-				enrichError(err, instance);
-				pushToDlq({ requestId, uuid, instance, errorType: 'unhandled-rejection' });
+				// a wrapped rejection is pinned to the instance when it settles
+				const pending = wrap(() => Promise.reject(err), instance)() as Promise<unknown>;
+				pending.catch((caught: Error) => {
+					pushToDlq({ error: caught, errorType: 'unhandled-rejection' });
+				});
 				if (!noThrow) {
 					setImmediate(() => {
-						Promise.reject(err);
+						Promise.reject(err); // real boundary: already pinned above
 					});
 				}
 			} else {
 				const childCtor = inst.StressChild;
 				if (typeof childCtor === 'function') {
 					try {
+						// creationError hook pins the failure to the surviving parent
 						new (childCtor as new (data: unknown) => object)({ forceError: true });
-					} catch (err) {
-						enrichError(err as Error, instance);
-						pushToDlq({ requestId, uuid, instance, errorType: 'creation-error' });
-						if (!noThrow) throw err;
+					} catch (caught) {
+						pushToDlq({ error: caught as Error, errorType: 'creation-error' });
+						if (!noThrow) throw caught;
 					}
 				} else {
 					const err = new Error(`no child ctor: ${uuid}`);
-					enrichError(err, instance);
-					pushToDlq({ requestId, uuid, instance, errorType: 'sync-throw' });
+					try {
+						wrap(() => {
+							throw err;
+						}, instance)();
+					} catch (caught) {
+						pushToDlq({ error: caught as Error, errorType: 'sync-throw' });
+					}
 					if (!noThrow) throw err;
 				}
 			}

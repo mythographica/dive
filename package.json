@@ -25,6 +25,9 @@
 		"test:watch": "vitest",
 		"prepublishOnly": "tsc"
 	},
+	"publishConfig": {
+		"access": "public"
+	},
 	"peerDependencies": {
 		"mnemonica": "^1.0.0"
 	},

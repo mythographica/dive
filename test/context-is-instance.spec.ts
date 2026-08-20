@@ -6,7 +6,8 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTypesCollection, getProps } from 'mnemonica/module';
-import { attachHooks, current, clear } from '../src/index.js';
+import { current, clear } from '../src/index.js';
+import { attachHooks } from './helpers/attach-hooks.js';
 
 describe('lastContext IS the instance', () => {
 	beforeEach(() => clear());

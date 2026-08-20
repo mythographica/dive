@@ -22,11 +22,11 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTypesCollection } from 'mnemonica/module';
 
 import {
-	attachHooks,
 	current,
 	getErrorInstance,
 	clear,
 } from '../src/index.js';
+import { attachHooks } from './helpers/attach-hooks.js';
 
 describe('attachHooks: preCreation enters parent context', () => {
 	beforeEach(() => clear());

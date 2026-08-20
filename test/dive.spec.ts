@@ -10,12 +10,12 @@ import { createTypesCollection } from 'mnemonica/module';
 import type { TypesCollection } from 'mnemonica/module';
 
 import {
-	attachHooks,
 	wrap,
 	current,
 	getErrorInstance,
 	clear,
 } from '../src/index.js';
+import { attachHooks } from './helpers/attach-hooks.js';
 
 describe('dive current()', () => {
 	beforeEach(() => clear());

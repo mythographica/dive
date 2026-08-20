@@ -24,11 +24,62 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createTypesCollection } from 'mnemonica/module';
-import { attachHooks, getErrorInstance, getFlow } from '../../build/index.js';
+import {
+	enterContext,
+	wrapConstructorArg,
+	upgradeConstructorArg,
+	wrapInstanceMethods,
+	recordCreation,
+	recordCreationError,
+	isWrappedFunction,
+	getErrorInstance,
+	getFlow,
+} from '../../build/index.js';
 
 const mode = process.argv[2] || 'throw';
 const als = new AsyncLocalStorage();
 const queue = [];
+
+// The wiring that used to ship inside dive as attachHooks() — mnemonica-specific,
+// now adapter-level (@mnemonica/nestjs). Inlined here because this fixture runs
+// as a plain node child process and cannot import the TS test helper.
+function attachHooks (collection) {
+	collection.registerHook('preCreation', ({ existentInstance: parent, args }) => {
+		if (parent) {
+			enterContext(parent);
+		}
+		if (Array.isArray(args)) {
+			for (let i = 0; i < args.length; i++) {
+				const arg = args[i];
+				if (typeof arg === 'function' && !isWrappedFunction(arg)) {
+					args[i] = wrapConstructorArg(arg, parent);
+				}
+			}
+		}
+	});
+
+	collection.registerHook('postCreation', (hookData) => {
+		const instance = hookData.inheritedInstance;
+		if (!instance) {
+			return;
+		}
+		if (Array.isArray(hookData.args)) {
+			for (const arg of hookData.args) {
+				upgradeConstructorArg(arg, instance);
+			}
+		}
+		recordCreation(hookData.TypeName || 'anonymous', instance, hookData.existentInstance);
+		wrapInstanceMethods(instance);
+	});
+
+	collection.registerHook('creationError', (hookData) => {
+		recordCreationError(
+			hookData.TypeName || 'anonymous',
+			hookData.inheritedInstance,
+			hookData.existentInstance
+		);
+	});
+}
 
 function report (via, err) {
 	const store = als.getStore();

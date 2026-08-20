@@ -12,20 +12,23 @@
  *     switcher clobbering cannot corrupt the trace)
  *   - errors are pinned to their deepest edge (flight recorder)
  *   - the ring buffer bounds memory (oldest edges evicted)
+ *   - async edges close at chain settlement ('ok' + full-lifetime duration);
+ *     'running' means genuinely unsettled
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTypesCollection } from 'mnemonica/module';
 import type { TypesCollection } from 'mnemonica/module';
 
 import {
-	attachHooks,
 	wrap,
 	current,
 	getFlow,
 	getErrorInstance,
+	isWrappedFunction,
 	setTraceLimit,
 	clear,
 } from '../src/index.js';
+import { attachHooks } from './helpers/attach-hooks.js';
 
 describe('trace: construction edges follow the data flow', () => {
 	let collection: TypesCollection;
@@ -261,6 +264,125 @@ describe('trace: errors are flight recorders', () => {
 		expect(flow[1].name).toBe('Broken');
 		expect(flow[1].status).toBe('error');
 		expect(flow[1].parentId).toBe(flow[0].id);
+	});
+});
+
+describe('trace: async edges close at chain settlement', () => {
+	beforeEach(() => clear());
+
+	it('a successful async call closes its edge ok with full-lifetime duration', async () => {
+		const ctx = { id: 'async-ok' };
+		const fn = wrap(async () => {
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 30);
+			});
+			const result = 42;
+			return result;
+		}, ctx);
+
+		const value = await fn();
+		expect(value).toBe(42);
+
+		const flow = getFlow(ctx);
+		expect(flow.length).toBe(1);
+		expect(flow[0].status).toBe('ok');
+		expect(flow[0].duration).toBeGreaterThanOrEqual(25);
+	});
+
+	it('an edge reads running ONLY while the async work is genuinely unsettled', async () => {
+		const ctx = { id: 'in-flight' };
+		let gate: () => void = () => undefined;
+		const fn = wrap(async () => {
+			await new Promise<void>((resolve) => {
+				gate = resolve;
+			});
+			const result = 1;
+			return result;
+		}, ctx);
+
+		const pending = fn();
+		// getFlow returns copies, so this is a snapshot of the in-flight state
+		const midFlow = getFlow(ctx);
+		expect(midFlow[0].status).toBe('running');
+
+		gate();
+		await pending;
+
+		const endFlow = getFlow(ctx);
+		expect(endFlow[0].status).toBe('ok');
+	});
+
+	it('a promise resolving to a promise closes the edge only at the true end', async () => {
+		const ctx = { id: 'chain' };
+		const fn = wrap(async () => {
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 20);
+			});
+			const inner = (async () => {
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, 20);
+				});
+				const result = 'deep';
+				return result;
+			})();
+			// assimilation: the outer promise adopts the inner one; the tap
+			// fires only after the WHOLE chain settles, with the final value
+			const result = inner;
+			return result;
+		}, ctx);
+
+		const value = await fn();
+		expect(value).toBe('deep');
+
+		const flow = getFlow(ctx);
+		expect(flow.length).toBe(1);
+		expect(flow[0].status).toBe('ok');
+		// duration covers BOTH legs, not just the synchronous head
+		expect(flow[0].duration).toBeGreaterThanOrEqual(35);
+	});
+
+	it('a rejection INSIDE a nested promise chain pins the error to the call', async () => {
+		const ctx = { id: 'chain-fail' };
+		const err = new Error('deep async boom');
+		const fn = wrap(async () => {
+			const inner = (async () => {
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, 10);
+				});
+				throw err;
+			})();
+			const result = inner;
+			return result;
+		}, ctx);
+
+		await expect(fn()).rejects.toThrow('deep async boom');
+		expect(getErrorInstance(err)).toBe(ctx);
+
+		const flow = getFlow(err);
+		expect(flow.length).toBe(1);
+		expect(flow[0].status).toBe('error');
+	});
+
+	it('a promise resolving to a function delivers it wrapped, context intact', async () => {
+		const ctx = { id: 'fn-delivery' };
+		const fn = wrap(async () => {
+			const deliveredFn = () => 'delivered-value';
+			return deliveredFn;
+		}, ctx);
+
+		const delivered = await fn();
+		expect(isWrappedFunction(delivered)).toBe(true);
+
+		// invoking it records its own edge against the captured context
+		const value = (delivered as () => string)();
+		expect(value).toBe('delivered-value');
+
+		const flow = getFlow(ctx);
+		expect(flow.length).toBe(2);
+		expect(flow[0].status).toBe('ok'); // the delivering call closed at settle
+		expect(flow[1].name).toBe('deliveredFn');
+		expect(flow[1].instance).toBe(ctx);
+		expect(flow[1].status).toBe('ok');
 	});
 });
 

@@ -1,5 +1,5 @@
 /**
- * @mnemonica/dive — Data + Flow for mnemonica instances.
+ * @mnemonica/dive — Data + Flow for userland instances.
  *
  * The Goal: uncaughtException / unhandledRejection never know where they came
  * from or WHICH DATA caused them. Dive answers it: context is pinned to
@@ -8,21 +8,29 @@
  * deepest trace edge — so the error carries both the data and the flow that
  * happened to it. No AsyncLocalStorage, no async_hooks.
  *
+ * Dive is framework- and library-agnostic: it imports nothing at all.
+ * The mnemonica hook wiring (attachHooks) lives in @mnemonica/nestjs — dive
+ * only exports the primitives that wiring is built from.
+ *
  * Public API:
- *   dive.attachHooks(collection)  → wire dive into a mnemonica types collection
  *   dive.wrap(fn, context?)       → capture context now, restore + record at invocation
  *   dive.current()                → the instance executing right now
  *   dive.getFlow(target?)         → execution branch: Error | instance | current cursor
  *   dive.getErrorInstance(error)  → the data pinned to an error
  *   dive.setTraceLimit(n)         → ring-buffer size for the trace (0 disables recording)
- *   dive.thunderstruck.feed(data) → stash pre-root data ahead of construction → uuid
- *   dive.thunderstruck.collected  → pending pre-root payloads (Map copy, by uuid)
  *   dive.clear()                  → reset everything (testing)
+ *
+ * Integration primitives (for adapter-level wiring, e.g. @mnemonica/nestjs):
+ *   dive.enterContext(instance)        → switch the current() context
+ *   dive.wrapConstructorArg(fn, ctx)   → wrap a constructor arg, upgradeable context
+ *   dive.upgradeConstructorArg(arg, i) → upgrade an unused arg callback to the instance
+ *   dive.wrapInstanceMethods(instance) → wrap the instance's prototype methods
+ *   dive.recordCreation(name, i, p?)   → 'create' edge under data-flow parentage
+ *   dive.recordCreationError(n, e, p?) → failed 'create' edge + error pinning
+ *   dive.isWrappedFunction(fn)         → is this function already dive-wrapped?
  *
  * Internals:
  *   - edges: Map<id, FlowEdge> ring buffer (oldest evicted past traceLimit)
- *   - pendingCollected: Map<uuid, data> — fed pre-root payloads, released at
- *     the next ROOT postCreation (Thunderstruck, see thunderstruck below)
  *   - cursor: id of the edge executing right now; null at rest
  *   - activeDepth: how deep we are inside wrapped invocations; depth > 0 means
  *     the cursor is a truthful execution parent, depth === 0 means we entered
@@ -34,12 +42,22 @@
  *     NOT used for trace parentage, so concurrent flows cannot corrupt the trace
  */
 
-import { randomUUID } from 'node:crypto';
-
 const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');
 const SymbolDiveEdge = Symbol.for('mnemonica.dive.edge');
 const SymbolDiveWrapped = Symbol.for('mnemonica.dive.wrapped');
 const SymbolDiveArgHolder = Symbol.for('mnemonica.dive.argHolder');
+
+// The domain vocabulary, defined once — a single source of truth for every
+// status, kind, and fallback name the trace can carry.
+const STATUS_RUNNING = 'running';
+const STATUS_OK = 'ok';
+const STATUS_ERROR = 'error';
+const KIND_CREATE = 'create';
+const KIND_CALL = 'call';
+const KIND_CONSTRUCT = 'construct';
+const KIND_METHOD = 'method';
+const ANONYMOUS = 'anonymous';
+const FN_NAME = 'name';
 
 export type FlowKind = 'create' | 'call' | 'construct' | 'method';
 export type FlowStatus = 'running' | 'ok' | 'error';
@@ -67,35 +85,9 @@ let traceLimit = 1024;
 let cursor: number | null = null;
 let activeDepth = 0;
 let lastContext: object | undefined;
-// Thunderstruck pending store: payloads fed ahead of construction,
-// released at the next ROOT postCreation (see thunderstruck below).
-let pendingCollected = new Map<string, unknown>();
 
 function isObjectKey (value: unknown): value is object {
 	return value !== null && (typeof value === 'object' || typeof value === 'function');
-}
-
-/**
- * A ROOT construction's existentInstance is the Mnemosyne base prototype —
- * its constructor.name stays 'Mnemonica' by core's nominal-typing design.
- * Sub-constructions carry a real parent instance instead, so this check is
- * what tells "the pre-root window closes now" from "a chain level finished".
- */
-function isMnemosyneBase (value: unknown): boolean {
-	if (!isObjectKey(value)) {
-		return false;
-	}
-	const ctor = (value as { constructor?: { name?: string } }).constructor;
-	const result = !!ctor && ctor.name === 'Mnemonica';
-	return result;
-}
-
-/**
- * Drop every pending pre-root payload. Called at root postCreation and by
- * clear() — delivery happened (or never will); retention is not our job.
- */
-function releaseCollected (): void {
-	pendingCollected = new Map<string, unknown>();
 }
 
 /**
@@ -119,7 +111,7 @@ function recordEdge (
 		kind,
 		ts       : Date.now(),
 		duration : undefined,
-		status   : 'running',
+		status   : STATUS_RUNNING,
 	};
 	edges.set(edge.id, edge);
 	while (edges.size > traceLimit) {
@@ -170,7 +162,7 @@ function pinError (error: unknown, edge: FlowEdge | undefined, instance: object 
 		return;
 	}
 	if (edge) {
-		edge.status = 'error';
+		edge.status = STATUS_ERROR;
 	}
 	if (SymbolDiveEdge in (error as Record<symbol, unknown>)) {
 		return;
@@ -194,18 +186,58 @@ function pinError (error: unknown, edge: FlowEdge | undefined, instance: object 
 }
 
 /**
- * Store the last context (the switcher behind current()).
- * Called by the lifecycle hooks; deliberately not exported.
+ * Switch the "newest-wins" context behind current(). Integration primitive:
+ * adapter-level wiring calls it when a lifecycle event enters an instance's
+ * context (e.g. preCreation enters the parent, postCreation the instance).
+ * Deliberately NOT used for trace parentage — concurrent flows cannot
+ * corrupt the trace through it.
  */
-function setLastContext (instance: object | undefined): void {
+export function enterContext (instance: object | undefined): void {
 	lastContext = instance;
 }
 
 /**
- * Check if a function is already dive-wrapped.
+ * Check if a function is already dive-wrapped. Integration primitive:
+ * adapter-level wiring uses it to avoid double-wrapping constructor args.
  */
-function isWrappedFunction (value: unknown): boolean {
+export function isWrappedFunction (value: unknown): boolean {
 	return typeof value === 'function' && SymbolDiveWrapped in (value as unknown as Record<symbol, unknown>);
+}
+
+/**
+ * Tap a promise result so the edge tells the truth about the async work:
+ *
+ *   - the edge closes ('ok' + full-lifetime duration) when the WHOLE chain
+ *     settles. A promise never resolves TO a promise: the runtime flattens
+ *     thenables before any .then callback fires (assimilation), so this tap
+ *     always sees the final value — a promise returning a promise needs no
+ *     wrapping of its own, the tap simply outlives the whole chain;
+ *   - a function resolved at the end is wrapped, so context propagates
+ *     forward to its future invocations;
+ *   - a rejection at ANY depth of the chain propagates here and pins the
+ *     error to this edge (deepest-pin wins, see pinError).
+ */
+function tapPromise (
+	result: Promise<unknown>,
+	edge: FlowEdge | undefined,
+	context: object | undefined,
+	started: number
+): Promise<unknown> {
+	const promiseResult = result.then((resolved: unknown) => {
+		if (edge) {
+			edge.status = STATUS_OK;
+			edge.duration = Date.now() - started;
+		}
+		if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
+			const wrappedResult = wrap(resolved as (...args: unknown[]) => unknown, context);
+			return wrappedResult;
+		}
+		return resolved;
+	}).catch((error: unknown) => {
+		pinError(error, edge, context);
+		throw error;
+	});
+	return promiseResult;
 }
 
 /**
@@ -216,8 +248,9 @@ function isWrappedFunction (value: unknown): boolean {
  * Handles:
  *   - `new` calls via Reflect.construct (kind: 'construct')
  *   - Returned functions are wrapped to propagate context
- *   - Promise resolutions are wrapped if they resolve to functions;
- *     rejections pin the error to the call's edge
+ *   - Promise results are tapped (see tapPromise): the edge closes when the
+ *     whole chain settles, resolved functions are wrapped, rejections pin
+ *     the error to the call's edge
  */
 export function wrap<T extends (...args: unknown[]) => unknown> (
 	fn: T,
@@ -236,8 +269,8 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 		lastContext = capturedContext;
 
 		const edge = recordEdge(
-			isConstructor ? 'construct' : 'call',
-			(fn as { name?: string }).name || 'anonymous',
+			isConstructor ? KIND_CONSTRUCT : KIND_CALL,
+			(fn as { name?: string }).name || ANONYMOUS,
 			capturedContext,
 			executionParent(capturedContext)
 		);
@@ -270,23 +303,16 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 				result = wrap(result as (...args: unknown[]) => unknown, capturedContext);
 			}
 
-			// If Promise, wrap resolved value if it's a function; pin rejections
+			// If Promise: tap it — the edge closes ('ok' + full-lifetime
+			// duration) when the whole chain settles; resolved functions are
+			// wrapped to carry context forward; rejections pin to this edge.
 			if (result instanceof Promise) {
-				const promiseEdge = edge;
-				const promiseResult = result.then((resolved: unknown) => {
-					if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
-						return wrap(resolved as (...args: unknown[]) => unknown, capturedContext);
-					}
-					return resolved;
-				}).catch((error: unknown) => {
-					pinError(error, promiseEdge, capturedContext);
-					throw error;
-				});
+				const promiseResult = tapPromise(result, edge, capturedContext, started);
 				return promiseResult;
 			}
 
 			if (edge) {
-				edge.status = 'ok';
+				edge.status = STATUS_OK;
 			}
 			return result;
 		} catch (error: unknown) {
@@ -306,7 +332,7 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 	Object.setPrototypeOf(wrapped, fn);
 	wrapped.prototype = fn.prototype;
 
-	Object.defineProperty(wrapped, 'name', {
+	Object.defineProperty(wrapped, FN_NAME, {
 		value        : `diveWrapped:${(fn as { name?: string }).name}`,
 		configurable : true,
 	});
@@ -321,8 +347,8 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 }
 
 /**
- * Auto-wrap function arguments in an array. Internal: used by wrap() and the
- * lifecycle hooks; not part of the public API.
+ * Auto-wrap function arguments in an array. Internal: used by wrap() and by
+ * wrapInstanceMethods(); not part of the public API.
  */
 function wrapArgs (
 	args: unknown[],
@@ -337,7 +363,8 @@ function wrapArgs (
 }
 
 /**
- * Wrap a constructor argument with an UPGRADEABLE context.
+ * Wrap a constructor argument with an UPGRADEABLE context. Integration
+ * primitive — the adapter-level wiring calls it from preCreation.
  *
  * At preCreation the built instance does not exist yet, so the callback is bound
  * to the parent (existentInstance) via a mutable holder. If it is never invoked
@@ -350,7 +377,7 @@ function wrapArgs (
  * returned-function / promise propagation, reading the holder's CURRENT context
  * each time.
  */
-function wrapConstructorArg (
+export function wrapConstructorArg (
 	fn: (...args: unknown[]) => unknown,
 	context: object | undefined
 ): (...args: unknown[]) => unknown {
@@ -376,9 +403,10 @@ function wrapConstructorArg (
 
 /**
  * Upgrade an as-yet-unused constructor-arg callback to the built instance.
+ * Integration primitive — the adapter-level wiring calls it from postCreation.
  * No-op for non-wrapped args, or callbacks already invoked during construction.
  */
-function upgradeConstructorArg (arg: unknown, instance: object): void {
+export function upgradeConstructorArg (arg: unknown, instance: object): void {
 	if (typeof arg !== 'function') {
 		return;
 	}
@@ -391,6 +419,7 @@ function upgradeConstructorArg (arg: unknown, instance: object): void {
 /**
  * Wrap user-defined methods so they run with the receiving instance as the
  * active dive context AND record each call as a 'method' edge.
+ * Integration primitive — the adapter-level wiring calls it from postCreation.
  *
  * Wrapping is applied to the instance's immediate PROTOTYPE (not the instance
  * itself), using `this` (the receiver) as the context. For plain classes —
@@ -405,7 +434,7 @@ function upgradeConstructorArg (arg: unknown, instance: object): void {
  *   - wrap function return values
  *   - pin errors (sync throws and promise rejections) to the call's edge
  */
-function wrapInstanceMethods (instance: object): void {
+export function wrapInstanceMethods (instance: object): void {
 	const proto = Object.getPrototypeOf(instance);
 	if (!proto || proto === Object.prototype) {
 		return;
@@ -436,7 +465,7 @@ function wrapInstanceMethods (instance: object): void {
 			const previousCursor = cursor;
 			lastContext = context;
 
-			const edge = recordEdge('method', name, context, executionParent(context));
+			const edge = recordEdge(KIND_METHOD, name, context, executionParent(context));
 			if (edge) {
 				cursor = edge.id;
 			}
@@ -452,21 +481,12 @@ function wrapInstanceMethods (instance: object): void {
 				}
 
 				if (result instanceof Promise) {
-					const promiseEdge = edge;
-					const promiseResult = result.then((resolved: unknown) => {
-						if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
-							return wrap(resolved as (...args: unknown[]) => unknown, context);
-						}
-						return resolved;
-					}).catch((error: unknown) => {
-						pinError(error, promiseEdge, context);
-						throw error;
-					});
+					const promiseResult = tapPromise(result, edge, context, started);
 					return promiseResult;
 				}
 
 				if (edge) {
-					edge.status = 'ok';
+					edge.status = STATUS_OK;
 				}
 				return result;
 			} catch (error: unknown) {
@@ -499,58 +519,37 @@ function wrapInstanceMethods (instance: object): void {
 }
 
 /**
- * Attach dive to a mnemonica TypesCollection.
+ * Record a successful construction as a 'create' edge. Integration primitive —
+ * the adapter-level wiring calls it from postCreation.
  *
- * preCreation  → enter the parent (existentInstance) context BEFORE the
- *                constructor runs, and wrap any function arguments so
- *                callbacks handed to the constructor carry that context.
- * postCreation → record the instance's 'create' edge — parented on the
- *                DATA-FLOW parent (the existentInstance's latest edge), so
- *                construction at an unwrapped boundary starts a truthful new
- *                branch instead of merging into whatever flow ran last —
- *                then wrap the instance's methods.
- * creationError→ record a failed 'create' edge (status: 'error') under the
- *                surviving parent and pin the error to it: the failure is
- *                recoverable off the error object itself.
+ * The edge is parented on the DATA-FLOW parent (the parent instance's latest
+ * edge), so construction at an unwrapped boundary starts a truthful new branch
+ * instead of merging into whatever flow ran last; root types fall back to the
+ * execution cursor only when truly nested. Also switches current() to the
+ * built instance.
  */
-export function attachHooks (collection: {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	registerHook: (type: any, fn: any) => void;
-}): void {
-	collection.registerHook('preCreation', (hookData: { existentInstance?: object; args?: unknown[] }) => {
-		const parent = hookData.existentInstance;
-		if (parent) {
-			setLastContext(parent);
-		}
-		const args = hookData.args;
-		if (Array.isArray(args)) {
-			for (let i = 0; i < args.length; i++) {
-				const arg = args[i];
-				if (typeof arg === 'function' && !isWrappedFunction(arg)) {
-					args[i] = wrapConstructorArg(arg as (...a: unknown[]) => unknown, parent);
-				}
-			}
-		}
-	});
+export function recordCreation (name: string, instance: object, parent?: object): void {
+	let parentId: number | null = null;
+	if (isObjectKey(parent)) {
+		const own = latestEdge.get(parent);
+		parentId = own !== undefined ? own : null;
+	} else if (activeDepth > 0 && cursor !== null) {
+		parentId = cursor;
+	}
+	recordEdge(KIND_CREATE, name || ANONYMOUS, instance, parentId);
+	enterContext(instance);
+}
 
-	collection.registerHook('postCreation', (hookData: {
-		inheritedInstance?: object;
-		existentInstance?: object;
-		args?: unknown[];
-		TypeName?: string;
-	}) => {
-		const instance = hookData.inheritedInstance;
-		if (!instance) {
-			return;
-		}
-		if (Array.isArray(hookData.args)) {
-			for (const arg of hookData.args) {
-				upgradeConstructorArg(arg, instance);
-			}
-		}
-		// Data-flow parentage: the parent instance's own story continues.
-		// Root types fall back to the execution cursor only when truly nested.
-		const parent = hookData.existentInstance;
+/**
+ * Record a FAILED construction as a 'create' edge (status: 'error') under the
+ * surviving parent, and pin the error to it: the failure is recoverable off
+ * the error object itself. Integration primitive — the adapter-level wiring
+ * calls it from creationError.
+ */
+export function recordCreationError (name: string, errored: unknown, parent?: object): void {
+	if (errored instanceof Error) {
+		// Record the FAILED creation as an edge in the parent's branch, then
+		// pin the error to it — the flight recorder for "the data flow failed".
 		let parentId: number | null = null;
 		if (isObjectKey(parent)) {
 			const own = latestEdge.get(parent);
@@ -558,47 +557,17 @@ export function attachHooks (collection: {
 		} else if (activeDepth > 0 && cursor !== null) {
 			parentId = cursor;
 		}
-		recordEdge('create', hookData.TypeName || 'anonymous', instance, parentId);
-		setLastContext(instance);
-		wrapInstanceMethods(instance);
-		// Thunderstruck release: a ROOT construction closes the pre-root window.
-		// Sub-constructions must NOT drain — a root constructor may build
-		// sub-instances BEFORE reading thunderstruck.collected, and a sub's
-		// postCreation firing mid-construction must not steal that data.
-		if (isMnemosyneBase(hookData.existentInstance)) {
-			releaseCollected();
+		const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, parent, parentId);
+		if (edge) {
+			edge.duration = 0;
 		}
-	});
-
-	collection.registerHook('creationError', (hookData: {
-		inheritedInstance?: object;
-		existentInstance?: object;
-		TypeName?: string;
-	}) => {
-		const errored = hookData.inheritedInstance;
-		const parent = hookData.existentInstance;
-		if (errored instanceof Error) {
-			// Record the FAILED creation as an edge in the parent's branch, then
-			// pin the error to it — the flight recorder for "the data flow failed".
-			let parentId: number | null = null;
-			if (isObjectKey(parent)) {
-				const own = latestEdge.get(parent);
-				parentId = own !== undefined ? own : null;
-			} else if (activeDepth > 0 && cursor !== null) {
-				parentId = cursor;
-			}
-			const edge = recordEdge('create', hookData.TypeName || 'anonymous', parent, parentId);
-			if (edge) {
-				edge.duration = 0;
-			}
-			pinError(errored, edge, parent);
-		}
-		if (errored) {
-			setLastContext(errored);
-		} else if (parent) {
-			setLastContext(parent);
-		}
-	});
+		pinError(errored, edge, parent);
+	}
+	if (errored) {
+		enterContext(errored as object);
+	} else if (parent) {
+		enterContext(parent);
+	}
 }
 
 /**
@@ -662,43 +631,6 @@ export function getErrorInstance (error: Error): object | undefined {
 }
 
 /**
- * Thunderstruck — the Ahead-of-Construction Data Collector.
- *
- * The boundary (a Nest pipe/interceptor, a route handler, any entry point)
- * feeds raw request details BEFORE any mnemonica construction happens:
- *
- *   thunderstruck.feed(data)  → stores the payload, returns its uuid
- *   thunderstruck.collected   → getter: a COPY of everything fed and not yet
- *                               released (Map<uuid, data>) — a constructor
- *                               picks its own payload out by the uuid it was
- *                               handed through the invocation path
- *
- * Delivery is dive's only job: what the constructor does with the payload
- * (wire it into the root instance, build a pre-root chain, ignore it) is the
- * user's choice. If the data was wired to the instance during construction
- * it lives on with the instance; otherwise it is dropped — no retention.
- *
- * Lifetime: pending payloads are released at the next ROOT postCreation
- * (async constructors included: postCreation fires after the construction
- * promise resolves). A failed construction (creationError) does NOT release:
- * the payload that preceded a failure is exactly the data worth keeping.
- * Payloads fed without any following root construction stay pending until
- * the next root construction or clear() — so feed as close to construction
- * as possible.
- */
-export const thunderstruck = {
-	feed (data: unknown): string {
-		const id = randomUUID();
-		pendingCollected.set(id, data);
-		return id;
-	},
-	get collected (): Map<string, unknown> {
-		const copy = new Map(pendingCollected);
-		return copy;
-	},
-};
-
-/**
  * Set the ring-buffer size of the trace. 0 disables recording (context
  * switching still works; getFlow returns empty branches). Shrinking evicts
  * the oldest edges immediately.
@@ -718,8 +650,8 @@ export function setTraceLimit (limit: number): void {
 }
 
 /**
- * Reset everything: trace, cursor, depth, context, trace limit, and any
- * pending Thunderstruck payloads. Useful for testing.
+ * Reset everything: trace, cursor, depth, context, and trace limit.
+ * Useful for testing.
  */
 export function clear (): void {
 	edges = new Map<number, FlowEdge>();
@@ -729,5 +661,4 @@ export function clear (): void {
 	cursor = null;
 	activeDepth = 0;
 	lastContext = undefined;
-	releaseCollected();
 }

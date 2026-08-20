@@ -16,7 +16,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createTypesCollection } from 'mnemonica/module';
-import { attachHooks, wrap, current, getErrorInstance, getFlow, clear } from '../src/index.js';
+import { wrap, current, getErrorInstance, getFlow, clear } from '../src/index.js';
+import { attachHooks } from './helpers/attach-hooks.js';
 
 describe('decoupled queue: recover origin after the request ends', () => {
 	beforeEach(() => clear());

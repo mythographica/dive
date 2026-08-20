@@ -5,7 +5,7 @@
  * auto-wraps instance methods via the postCreation hook.
  */
 import { defaultTypes } from 'mnemonica/module';
-import { attachHooks } from '../../src/index.js';
+import { attachHooks } from '../helpers/attach-hooks.js';
 
 export interface StressData {
 	uuid      : string;

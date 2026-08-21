@@ -1,6 +1,6 @@
 {
 	"name": "@mnemonica/dive",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"description": "Object-bound context propagation and execution-flow tracing — no ALS, no async_hooks",
 	"type": "module",
 	"main": "./build/index.js",

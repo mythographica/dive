@@ -560,7 +560,7 @@ synchronous execution splits break `async_hooks`-based CLS.
 
 The design decision log — considered-and-rejected alternatives, parked
 designs, and when to revisit them — lives in
-[DECISIONS.md](https://github.com/mythographica/dive) in the repository.
+[DECISIONS.md](https://github.com/mythographica/dive/blob/main/DECISIONS.md) in the repository.
 
 ---
 

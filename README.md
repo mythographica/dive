@@ -549,9 +549,18 @@ works. Something works, and these instruments will say so the day it stops.
   it — dive was never meant to be a storage. The adapter keeps those
   payloads in a `WeakMap` keyed on request objects: GC is the only release,
   and retention is exactly the request's lifetime.
+- **2026:** async edge closure — the promise tap now closes the edge
+  (`'ok'` + full-lifetime `duration`) when the whole chain settles, and
+  `'running'` means *genuinely unsettled*. The domain vocabulary
+  (statuses, kinds, fallback names) was hoisted to single-definition
+  constants.
 
 Motivation: [nodejs/diagnostics#249](https://github.com/nodejs/diagnostics/issues/249) —
 synchronous execution splits break `async_hooks`-based CLS.
+
+The design decision log — considered-and-rejected alternatives, parked
+designs, and when to revisit them — lives in
+[DECISIONS.md](https://github.com/mythographica/dive) in the repository.
 
 ---
 

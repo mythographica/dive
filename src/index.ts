@@ -46,6 +46,11 @@ const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');
 const SymbolDiveEdge = Symbol.for('mnemonica.dive.edge');
 const SymbolDiveWrapped = Symbol.for('mnemonica.dive.wrapped');
 const SymbolDiveArgHolder = Symbol.for('mnemonica.dive.argHolder');
+// Origin info installed on every wrap() wrapper: the ORIGINAL fn and the
+// captured context. This is what makes re-wrap shadowing possible — a
+// wrapper always knows what it wraps and whose story it tells.
+const SymbolDiveOriginal = Symbol.for('mnemonica.dive.original');
+const SymbolDiveContext = Symbol.for('mnemonica.dive.context');
 
 // The domain vocabulary, defined once — a single source of truth for every
 // status, kind, and fallback name the trace can carry.
@@ -56,10 +61,11 @@ const KIND_CREATE = 'create';
 const KIND_CALL = 'call';
 const KIND_CONSTRUCT = 'construct';
 const KIND_METHOD = 'method';
+const KIND_RECONTEXT = 'recontext';
 const ANONYMOUS = 'anonymous';
 const FN_NAME = 'name';
 
-export type FlowKind = 'create' | 'call' | 'construct' | 'method';
+export type FlowKind = 'create' | 'call' | 'construct' | 'method' | 'recontext';
 export type FlowStatus = 'running' | 'ok' | 'error';
 
 export interface FlowEdge {
@@ -145,7 +151,10 @@ function executionParent (context: object | undefined): number | null {
 	}
 	if (isObjectKey(context)) {
 		const own = latestEdge.get(context);
-		const result = own !== undefined ? own : null;
+		// The instance's latest edge may have been evicted from the ring
+		// buffer; parenting onto a dangling id would claim a story nobody
+		// retained. A forgotten continuation point is a fresh root.
+		const result = own !== undefined && edges.has(own) ? own : null;
 		return result;
 	}
 	return null;
@@ -229,7 +238,7 @@ function tapPromise (
 			edge.duration = Date.now() - started;
 		}
 		if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
-			const wrappedResult = wrap(resolved as (...args: unknown[]) => unknown, context);
+			const wrappedResult = wrapEntry(resolved as (...args: unknown[]) => unknown, context, true);
 			return wrappedResult;
 		}
 		return resolved;
@@ -245,6 +254,15 @@ function tapPromise (
  * invocation as a trace edge. If no context is provided, captures the current
  * context at wrap time.
  *
+ * Re-wrap policy (scope shadowing):
+ *   - wrap of an unwrapped fn            → new wrapper, captured context
+ *   - wrap of a wrapper, no/same context → idempotent: returned as-is
+ *   - wrap of a wrapper, DIFFERENT context → the callback changes ownership:
+ *     a 'recontext' handoff edge links the old story to the new one, and a
+ *     fresh wrapper around the ORIGINAL fn is bound to the new context
+ * Auto-wrap crossings (function args at every wrapped call) never shadow —
+ * they are idempotent by design.
+ *
  * Handles:
  *   - `new` calls via Reflect.construct (kind: 'construct')
  *   - Returned functions are wrapped to propagate context
@@ -256,10 +274,80 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 	fn: T,
 	context?: object
 ): T {
-	if (isWrappedFunction(fn)) {
+	const result = wrapEntry(fn, context, false);
+	return result;
+}
+
+/**
+ * Idempotence and shadowing policy behind wrap(). `auto` marks internal
+ * crossings (wrapArgs at every wrapped call, constructor-arg invocation
+ * reads): those are idempotent only, so a callback that already crossed one
+ * flow keeps its story when crossing another — re-rooting is the user's
+ * explicit act, never a side effect of passing a function around.
+ */
+function wrapEntry<T extends (...args: unknown[]) => unknown> (
+	fn: T,
+	context: object | undefined,
+	auto: boolean
+): T {
+	if (!isWrappedFunction(fn)) {
+		const result = wrapInternal(fn, context);
+		return result;
+	}
+
+	if (auto) {
 		return fn;
 	}
 
+	const existing = (fn as unknown as Record<symbol, unknown>)[SymbolDiveContext] as object | undefined;
+
+	// Explicit wrap with no context or the SAME context: idempotent.
+	if (context === undefined || context === existing) {
+		return fn;
+	}
+
+	// Wrappers without origin info (constructor-arg holders, whose context
+	// is a mutable holder by design) cannot be re-rooted this way.
+	const original = (fn as unknown as Record<symbol, unknown>)[SymbolDiveOriginal] as T | undefined;
+	if (original === undefined) {
+		return fn;
+	}
+
+	recordHandoff(original, existing, context);
+	const result = wrapInternal(original, context);
+	return result;
+}
+
+/**
+ * Record the ownership transfer of a re-rooted callback: a 'recontext'
+ * edge on the NEW context, parented on the OLD context's latest retained
+ * edge. Later invocations of the new wrapper continue from this edge via
+ * latestEdge, so getFlow walks backward across the re-root into the
+ * previous flow.
+ */
+function recordHandoff (
+	fn: (...args: unknown[]) => unknown,
+	previousContext: object | undefined,
+	context: object | undefined
+): void {
+	let parentId: number | null = null;
+	if (isObjectKey(previousContext)) {
+		const own = latestEdge.get(previousContext);
+		parentId = own !== undefined && edges.has(own) ? own : null;
+	}
+	const name = (fn as { name?: string }).name || ANONYMOUS;
+	recordEdge(KIND_RECONTEXT, name, context, parentId);
+}
+
+/**
+ * The actual wrapper construction behind wrapEntry: capture the context,
+ * record each invocation as an edge, propagate context through args,
+ * returned functions and promise chains, pin errors to the edge.
+ */
+function wrapInternal<T extends (...args: unknown[]) => unknown> (
+	fn: T,
+	context: object | undefined
+): T {
 	const capturedContext = context ?? lastContext;
 
 	const wrapped = function (this: unknown, ...args: unknown[]) {
@@ -300,7 +388,7 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 
 			// Wrap returned functions so they carry the context forward
 			if (typeof result === 'function' && !isWrappedFunction(result)) {
-				result = wrap(result as (...args: unknown[]) => unknown, capturedContext);
+				result = wrapEntry(result as (...args: unknown[]) => unknown, capturedContext, true);
 			}
 
 			// If Promise: tap it — the edge closes ('ok' + full-lifetime
@@ -343,6 +431,19 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 		enumerable   : false,
 	});
 
+	// Origin info for re-wrap shadowing (see wrapEntry).
+	Object.defineProperty(wrapped, SymbolDiveOriginal, {
+		value        : fn,
+		configurable : false,
+		enumerable   : false,
+	});
+
+	Object.defineProperty(wrapped, SymbolDiveContext, {
+		value        : capturedContext,
+		configurable : false,
+		enumerable   : false,
+	});
+
 	return wrapped;
 }
 
@@ -356,7 +457,8 @@ function wrapArgs (
 ): unknown[] {
 	return args.map((arg) => {
 		if (typeof arg === 'function') {
-			return wrap(arg as (...args: unknown[]) => unknown, context);
+			const result = wrapEntry(arg as (...args: unknown[]) => unknown, context, true);
+			return result;
 		}
 		return arg;
 	});
@@ -388,7 +490,9 @@ export function wrapConstructorArg (
 
 	const wrapped = function (this: unknown, ...args: unknown[]) {
 		holder.used = true;
-		return wrap(fn, holder.context).apply(this, args);
+		const wrappedCall = wrapEntry(fn, holder.context, true);
+		const result = wrappedCall.apply(this, args);
+		return result;
 	} as (...args: unknown[]) => unknown;
 
 	Object.defineProperty(wrapped, SymbolDiveWrapped, {
@@ -477,7 +581,7 @@ export function wrapInstanceMethods (instance: object): void {
 				let result = fn.apply(this, wrappedArgs);
 
 				if (typeof result === 'function' && !isWrappedFunction(result)) {
-					result = wrap(result as (...args: unknown[]) => unknown, context);
+					result = wrapEntry(result as (...args: unknown[]) => unknown, context, true);
 				}
 
 				if (result instanceof Promise) {
@@ -532,7 +636,7 @@ export function recordCreation (name: string, instance: object, parent?: object)
 	let parentId: number | null = null;
 	if (isObjectKey(parent)) {
 		const own = latestEdge.get(parent);
-		parentId = own !== undefined ? own : null;
+		parentId = own !== undefined && edges.has(own) ? own : null;
 	} else if (activeDepth > 0 && cursor !== null) {
 		parentId = cursor;
 	}
@@ -553,7 +657,7 @@ export function recordCreationError (name: string, errored: unknown, parent?: ob
 		let parentId: number | null = null;
 		if (isObjectKey(parent)) {
 			const own = latestEdge.get(parent);
-			parentId = own !== undefined ? own : null;
+			parentId = own !== undefined && edges.has(own) ? own : null;
 		} else if (activeDepth > 0 && cursor !== null) {
 			parentId = cursor;
 		}

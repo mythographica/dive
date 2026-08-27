@@ -223,6 +223,24 @@ Handles `new` calls (via `Reflect.construct`), wraps returned functions,
 wraps function arguments (recursively, to any depth), wraps Promise-resolved
 functions, and pins rejections to the call's edge.
 
+Re-wrapping an already wrapped function follows **scope shadowing**:
+
+- `wrap(w)` or `wrap(w, sameContext)` — idempotent, returned as-is.
+- `wrap(w, differentContext)` — the callback changes ownership: a
+  `'recontext'` handoff edge is recorded on the new context (parented on the
+  old context's latest retained edge), and a fresh wrapper around the
+  ORIGINAL function is returned — wrappers never stack. Existing references
+  to the old wrapper keep telling the old story.
+- Function arguments crossing wrapped calls are auto-wrapped idempotently —
+  they never shadow. Re-rooting is always your explicit act.
+
+```typescript
+const w1 = wrap(job, requestInstance);
+service.register(wrap(w1, serviceInstance));
+// handoff recorded: getFlow(serviceInstance) walks back through the
+// 'recontext' edge into requestInstance's branch
+```
+
 ### `current()`
 
 ```typescript
@@ -255,7 +273,7 @@ interface FlowEdge {
   instance: object | undefined;
   // type / method / function name
   name: string;
-  kind: 'create' | 'call' | 'construct' | 'method';
+  kind: 'create' | 'call' | 'construct' | 'method' | 'recontext';
   // start time (Date.now())
   ts: number;
   // ms, set when the invocation completes
@@ -474,6 +492,19 @@ const result2 = wrap(() => gen.next(), instance)();
 
 For async generators, wrap the resumptions the same way — the `async` keyword
 does not change the wrapping semantics.
+
+Note that wrapping the generator *function* itself does not help: the wrapped
+call returns the iterator object, the edge closes `'ok'` at that moment, and
+the body still runs later through unwrapped `next()` calls. `wrap()` traces
+iterator creation, not the body — the resumptions are the unit of work, so
+they are what you wrap.
+
+The deeper reason this stays manual: `yield` is a "stop the world on the
+stack" pattern — it suspends the frame itself, where `async`/`await` is a
+simple continuation the promise tap can outlive. Intercepting `next()` would
+mean dive owns the iterator protocol's pacing — computability bought at the
+expense of debuggability. Reframe the usage instead: collect the steps,
+`await` them, or wrap each resumption explicitly.
 
 ### The Rule of Thumb
 

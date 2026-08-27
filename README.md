@@ -309,8 +309,62 @@ the oldest edges immediately.
 clear(): void;
 ```
 
-Reset everything: trace, cursor, depth, context, and trace limit.
-Useful for testing.
+Reset everything: trace, cursor, depth, context, trace limit, and the
+registered lifecycle hooks. Useful for testing — adapter-level subscribers
+must re-register after a `clear()`.
+
+### `registerHook(event, hook)`
+
+```typescript
+const unregister = registerHook('enter', (payload) => { /* ... */ });
+unregister();
+// or, by reference, when the closure was not kept:
+unregisterHook('enter', myHook);
+```
+
+Dive **publishes** its ground truth — emission, never ingestion. Subscribers
+(ALS/OTel vendors, monitoring layers) correlate from THEIR side at the one
+moment both trees share a frame; dive never imports `async_hooks` and never
+trusts external propagation. Same shape and philosophy as mnemonica's own
+`registerHook`. Detach via the returned unregister function, or with
+`unregisterHook(event, hook)` when the closure was not kept (no-op for
+unknown hooks).
+
+Events:
+
+- **`enter`** — right after the edge is recorded, while `cursor` and
+  `lastContext` hold the truthful values. Payload: the fresh **edge object
+  itself** (attach your own symbols to it — a span id gives you the reverse
+  join for free) plus the invocation `args` by reference.
+- **`leave`** — the sync close, with the edge's final `status`/`duration` and
+  what the wrap produced (plain value / wrapped function / tapped promise;
+  `undefined` when the call threw).
+- **`settle`** — when a tapped promise chain closes: `result` on resolution,
+  `error` on rejection. Distinct from `leave`, so "the sync head returned" is
+  never confused with "the work is done".
+- **`recontext`** — a re-wrap handoff: the callback changed ownership, and the
+  payload (`fn`, `previousContext`, `context`, plus the handoff edge) links the
+  old context's story to the new one.
+
+Hooks fire only when an edge is recorded — with `setTraceLimit(0)` no event
+fires. Dispatch cost when nobody is subscribed is one length check per edge.
+Subscriber exceptions are contained per-subscriber: a throwing hook degrades
+its own observability, never the trace.
+
+```typescript
+import { registerHook } from '@mnemonica/dive';
+
+// correlate an OTel span with every wrapped call
+registerHook('enter', ({ edge, args }) => {
+	const span = tracer.startSpan(edge.name);
+	(edge as Record<symbol, unknown>)[SPAN] = span;
+});
+registerHook('settle', ({ edge, error }) => {
+	const span = (edge as Record<symbol, unknown>)[SPAN] as Span | undefined;
+	if (error) span?.recordException(error);
+	span?.end();
+});
+```
 
 ---
 

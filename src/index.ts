@@ -18,6 +18,8 @@
  *   dive.getFlow(target?)         → execution branch: Error | instance | current cursor
  *   dive.getErrorInstance(error)  → the data pinned to an error
  *   dive.setTraceLimit(n)         → ring-buffer size for the trace (0 disables recording)
+ *   dive.registerHook(event, cb)  → subscribe to edge lifecycle: enter | leave | settle | recontext
+ *   dive.unregisterHook(ev, cb)   → detach an exact subscriber by reference
  *   dive.clear()                  → reset everything (testing)
  *
  * Integration primitives (for adapter-level wiring, e.g. @mnemonica/nestjs):
@@ -83,6 +85,165 @@ export interface FlowEdge {
 // postCreation can upgrade an as-yet-unused callback from the parent context to
 // the built instance it belongs to. `used` is set the moment it is invoked.
 interface DiveArgHolder { context: object | undefined; used: boolean; }
+
+/**
+ * Edge lifecycle hooks — dive PUBLISHES its ground truth (emission, never
+ * ingestion). ALS/OTel vendors subscribe and correlate from THEIR side at the
+ * one moment both trees share a frame; dive never imports async_hooks and
+ * never trusts external propagation.
+ *
+ *   enter     — right after the edge is recorded, while cursor and lastContext
+ *               hold the truthful values. Payload: the fresh edge object ITSELF
+ *               (subscribers may attach their own symbols to it — span ids give
+ *               the reverse join for free) plus the invocation args by reference.
+ *   leave     — the sync close, with the edge's final status/duration and what
+ *               the wrap produced (plain value / wrapped function / tapped
+ *               promise; undefined when the call threw).
+ *   settle    — when a tapped promise chain closes. Distinct from leave so
+ *               "the sync head returned" is never confused with "the work is
+ *               done": result on resolution, error on rejection.
+ *   recontext — a re-wrap handoff: the callback changed ownership, payload
+ *               links the old context's story to the new one.
+ *
+ * Hooks fire only when an edge is recorded: with traceLimit 0 there is nothing
+ * to observe and no event fires. Dispatch cost when unsubscribed is one length
+ * check per edge; subscriber exceptions are contained per-subscriber — a
+ * throwing hook degrades its own observability, never the trace.
+ */
+export type DiveHookEvent = 'enter' | 'leave' | 'settle' | 'recontext';
+
+export interface DiveEnterPayload {
+	edge : FlowEdge;
+	args : unknown[];
+}
+
+export interface DiveLeavePayload {
+	edge   : FlowEdge;
+	result : unknown;
+}
+
+export interface DiveSettlePayload {
+	edge   : FlowEdge;
+	result : unknown;
+	error  : unknown;
+}
+
+export interface DiveRecontextPayload {
+	edge            : FlowEdge;
+	fn              : (...args: unknown[]) => unknown;
+	previousContext : object | undefined;
+	context         : object | undefined;
+}
+
+export type DiveHookPayload =
+	DiveEnterPayload | DiveLeavePayload | DiveSettlePayload | DiveRecontextPayload;
+
+type DiveHook<P> = (payload: P) => void;
+
+const hooks: Record<DiveHookEvent, Array<DiveHook<DiveHookPayload>>> = {
+	enter     : [],
+	leave     : [],
+	settle    : [],
+	recontext : [],
+};
+
+/**
+ * Subscribe to an edge lifecycle event. Returns an unregister function.
+ * Same shape and philosophy as mnemonica's own registerHook.
+ */
+export function registerHook (event: 'enter', hook: DiveHook<DiveEnterPayload>): () => void;
+export function registerHook (event: 'leave', hook: DiveHook<DiveLeavePayload>): () => void;
+export function registerHook (event: 'settle', hook: DiveHook<DiveSettlePayload>): () => void;
+export function registerHook (event: 'recontext', hook: DiveHook<DiveRecontextPayload>): () => void;
+export function registerHook (event: DiveHookEvent, hook: (...args: never[]) => void): () => void {
+	const subscribers = hooks[event];
+	// The public overloads narrow the payload per event; internally every
+	// subscriber is stored against the union and dispatched within its own try.
+	const stored = hook as DiveHook<DiveHookPayload>;
+	subscribers.push(stored);
+	const unregister = (): void => {
+		detachHook(event, stored);
+	};
+	return unregister;
+}
+
+function detachHook (event: DiveHookEvent, hook: DiveHook<DiveHookPayload>): void {
+	const subscribers = hooks[event];
+	const at = subscribers.indexOf(hook);
+	if (at !== -1) {
+		subscribers.splice(at, 1);
+	}
+}
+
+/**
+ * Detach an exact subscriber by reference — for when the unregister closure
+ * returned by registerHook was not kept. No-op for unknown hooks.
+ */
+export function unregisterHook (event: 'enter', hook: DiveHook<DiveEnterPayload>): void;
+export function unregisterHook (event: 'leave', hook: DiveHook<DiveLeavePayload>): void;
+export function unregisterHook (event: 'settle', hook: DiveHook<DiveSettlePayload>): void;
+export function unregisterHook (event: 'recontext', hook: DiveHook<DiveRecontextPayload>): void;
+export function unregisterHook (event: DiveHookEvent, hook: (...args: never[]) => void): void {
+	const stored = hook as DiveHook<DiveHookPayload>;
+	detachHook(event, stored);
+}
+
+/**
+ * Contained dispatch: every subscriber runs inside its own try, so a throwing
+ * hook degrades its own observability and never corrupts the edge, the result,
+ * or user code.
+ */
+function dispatchHook (subscribers: Array<DiveHook<DiveHookPayload>>, payload: DiveHookPayload): void {
+	for (const subscriber of subscribers) {
+		try {
+			subscriber(payload);
+		} catch {
+			// a throwing subscriber degrades its own observability, never the trace
+		}
+	}
+}
+
+function emitEnter (edge: FlowEdge, args: unknown[]): void {
+	const subscribers = hooks.enter;
+	if (subscribers.length === 0) {
+		return;
+	}
+	const payload: DiveEnterPayload = { edge, args };
+	dispatchHook(subscribers, payload);
+}
+
+function emitLeave (edge: FlowEdge, result: unknown): void {
+	const subscribers = hooks.leave;
+	if (subscribers.length === 0) {
+		return;
+	}
+	const payload: DiveLeavePayload = { edge, result };
+	dispatchHook(subscribers, payload);
+}
+
+function emitSettle (edge: FlowEdge, result: unknown, error: unknown): void {
+	const subscribers = hooks.settle;
+	if (subscribers.length === 0) {
+		return;
+	}
+	const payload: DiveSettlePayload = { edge, result, error };
+	dispatchHook(subscribers, payload);
+}
+
+function emitRecontext (
+	edge: FlowEdge,
+	fn: (...args: unknown[]) => unknown,
+	previousContext: object | undefined,
+	context: object | undefined
+): void {
+	const subscribers = hooks.recontext;
+	if (subscribers.length === 0) {
+		return;
+	}
+	const payload: DiveRecontextPayload = { edge, fn, previousContext, context };
+	dispatchHook(subscribers, payload);
+}
+
 
 let edges = new Map<number, FlowEdge>();
 let latestEdge = new WeakMap<object, number>();
@@ -237,13 +398,20 @@ function tapPromise (
 			edge.status = STATUS_OK;
 			edge.duration = Date.now() - started;
 		}
+		let settled: unknown = resolved;
 		if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
 			const wrappedResult = wrapEntry(resolved as (...args: unknown[]) => unknown, context, true);
-			return wrappedResult;
+			settled = wrappedResult;
 		}
-		return resolved;
+		if (edge) {
+			emitSettle(edge, settled, undefined);
+		}
+		return settled;
 	}).catch((error: unknown) => {
 		pinError(error, edge, context);
+		if (edge) {
+			emitSettle(edge, undefined, error);
+		}
 		throw error;
 	});
 	return promiseResult;
@@ -336,7 +504,10 @@ function recordHandoff (
 		parentId = own !== undefined && edges.has(own) ? own : null;
 	}
 	const name = (fn as { name?: string }).name || ANONYMOUS;
-	recordEdge(KIND_RECONTEXT, name, context, parentId);
+	const edge = recordEdge(KIND_RECONTEXT, name, context, parentId);
+	if (edge) {
+		emitRecontext(edge, fn, previousContext, context);
+	}
 }
 
 /**
@@ -364,10 +535,12 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 		);
 		if (edge) {
 			cursor = edge.id;
+			emitEnter(edge, args);
 		}
 		activeDepth++;
 
 		const started = edge ? edge.ts : 0;
+		let produced: unknown;
 		try {
 			// Wrap function args with the captured context so context propagates
 			// DOWN through nested callbacks (args of args). Because each wrapped
@@ -396,12 +569,14 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 			// wrapped to carry context forward; rejections pin to this edge.
 			if (result instanceof Promise) {
 				const promiseResult = tapPromise(result, edge, capturedContext, started);
+				produced = promiseResult;
 				return promiseResult;
 			}
 
 			if (edge) {
 				edge.status = STATUS_OK;
 			}
+			produced = result;
 			return result;
 		} catch (error: unknown) {
 			pinError(error, edge, capturedContext);
@@ -409,6 +584,7 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 		} finally {
 			if (edge) {
 				edge.duration = Date.now() - started;
+				emitLeave(edge, produced);
 			}
 			cursor = previousCursor;
 			activeDepth--;
@@ -572,10 +748,12 @@ export function wrapInstanceMethods (instance: object): void {
 			const edge = recordEdge(KIND_METHOD, name, context, executionParent(context));
 			if (edge) {
 				cursor = edge.id;
+				emitEnter(edge, args);
 			}
 			activeDepth++;
 
 			const started = edge ? edge.ts : 0;
+			let produced: unknown;
 			try {
 				const wrappedArgs = wrapArgs(args, context);
 				let result = fn.apply(this, wrappedArgs);
@@ -586,12 +764,14 @@ export function wrapInstanceMethods (instance: object): void {
 
 				if (result instanceof Promise) {
 					const promiseResult = tapPromise(result, edge, context, started);
+					produced = promiseResult;
 					return promiseResult;
 				}
 
 				if (edge) {
 					edge.status = STATUS_OK;
 				}
+				produced = result;
 				return result;
 			} catch (error: unknown) {
 				pinError(error, edge, context);
@@ -599,6 +779,7 @@ export function wrapInstanceMethods (instance: object): void {
 			} finally {
 				if (edge) {
 					edge.duration = Date.now() - started;
+					emitLeave(edge, produced);
 				}
 				cursor = previousCursor;
 				activeDepth--;
@@ -754,8 +935,9 @@ export function setTraceLimit (limit: number): void {
 }
 
 /**
- * Reset everything: trace, cursor, depth, context, and trace limit.
- * Useful for testing.
+ * Reset everything: trace, cursor, depth, context, trace limit, and the
+ * registered lifecycle hooks. Useful for testing — note that adapter-level
+ * subscribers must re-register after a clear().
  */
 export function clear (): void {
 	edges = new Map<number, FlowEdge>();
@@ -765,4 +947,8 @@ export function clear (): void {
 	cursor = null;
 	activeDepth = 0;
 	lastContext = undefined;
+	hooks.enter.length = 0;
+	hooks.leave.length = 0;
+	hooks.settle.length = 0;
+	hooks.recontext.length = 0;
 }

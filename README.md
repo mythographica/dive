@@ -282,6 +282,21 @@ interface FlowEdge {
 }
 ```
 
+### `getTrace()`
+
+```typescript
+getTrace(): FlowEdge[];
+```
+
+The whole retained trace — copies of every edge still in the ring buffer,
+oldest first. Unlike `getFlow()` it needs no target: this is the inspection
+surface for tooling (remote debugging, visualization) asking "what flowed
+through this process?" when no cursor is live.
+
+Edges carry their **instance reference** — callers crossing a process
+boundary (CDP, WS, HTTP) must map to a JSON-safe shape themselves (the
+adapter's `formatFlow` shows the idiom).
+
 ### `getErrorInstance(error)`
 
 ```typescript

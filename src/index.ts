@@ -16,6 +16,7 @@
  *   dive.wrap(fn, context?)       → capture context now, restore + record at invocation
  *   dive.current()                → the instance executing right now
  *   dive.getFlow(target?)         → execution branch: Error | instance | current cursor
+ *   dive.getTrace()               → the whole retained trace (copies), oldest first
  *   dive.getErrorInstance(error)  → the data pinned to an error
  *   dive.setTraceLimit(n)         → ring-buffer size for the trace (0 disables recording)
  *   dive.registerHook(event, cb)  → subscribe to edge lifecycle: enter | leave | settle | recontext
@@ -892,6 +893,21 @@ export function getFlow (target?: unknown): FlowEdge[] {
 		edge = edge.parentId !== null ? edges.get(edge.parentId) : undefined;
 	}
 	return branch;
+}
+
+/**
+ * The whole retained trace — copies of every edge still in the ring buffer,
+ * oldest first. Unlike getFlow() this needs no target: it is the inspection
+ * surface for tooling (remote debugging, visualization) that asks "what
+ * flowed through this process?" when no cursor is live.
+ *
+ * Same copy semantics as getFlow(): mutating the result never touches the
+ * trace. Edges carry their instance REFERENCE — callers crossing a process
+ * boundary (CDP, WS, HTTP) must map to a JSON-safe shape themselves.
+ */
+export function getTrace (): FlowEdge[] {
+	const result = [...edges.values()].map((edge) => ({ ...edge }));
+	return result;
 }
 
 /**

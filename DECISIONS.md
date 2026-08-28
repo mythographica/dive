@@ -45,9 +45,11 @@ experimentally: main and worker both mint id 6). Dive's charter is
 
 **Revisit when.** Someone needs to join dive edges to ALS-based span
 timings *inside one process* and the uuid correlation is demonstrably
-insufficient. The ready design: an injected `edgeProbe: () => number`
-supplied by the adapter (`executionAsyncId` from `node:async_hooks`) —
-dive itself still imports nothing.
+insufficient. NOTE (2026-08, hardened): the injected-probe sketch that
+used to live here is withdrawn — no `async_hooks` integration ships
+anywhere in the ecosystem, adapter included. The join mechanism is the
+edge lifecycle hooks API (0.5.0): subscribers read THEIR OWN store at
+enter/settle, the one moment both trees share a frame.
 
 ## 2026-08 — Multi-instance dive (`createDive`): designed, parked
 
@@ -165,13 +167,14 @@ dive's context is a named value, so the trace already says *where*.
 undiagnosable in practice. The escape hatch: an opt-in capture flag
 (off by default), one nullable field on `FlowEdge` — never always-on.
 
-## 2026-08 — Escape detection via `async_hooks` init hook (designed, parked)
+## 2026-08 — Escape detection via `async_hooks` init hook (REJECTED, retired)
 
-**Decision (direction).** A dev-mode diagnostic that WARNS about async
-work escaping unwrapped — never tracks it. Tracking escapes means
-following resources through the scheduler (ALS/zone territory); the
-chartered binary stays: wrapped or escaped. The detector only makes
-escapes *audible*.
+**Decision.** Retired, not parked — the design itself is rejected. No
+`async_hooks` integration ships anywhere in the ecosystem: not in dive
+("imports nothing"), not in the adapter, not as a dev-only utility. The
+constraint is charter-level; a diagnostic that requires process-wide
+hook registration violates it no matter where it is placed. This entry
+keeps the analysis so the design is never re-derived a third time.
 
 **Why the naive version is dead (verified experimentally).** Peeking
 `executionAsyncId()` at wrapped-call entry and exit cannot work: the
@@ -181,25 +184,23 @@ floating promise, and a microtask. The only observation point is the
 `init` hook, which fires synchronously at resource creation with
 `triggerAsyncId` naming the creating context.
 
-**The ready design.** At wrapped-call entry note `executionAsyncId()`
-(costless, no hook). Dev-mode hook: collect resources whose `init`
+**The rejected design (for the record).** At wrapped-call entry note
+`executionAsyncId()`. Dev-mode hook: collect resources whose `init`
 fires with `triggerAsyncId` === that entry id ("born inside this
 frame"). Every wrapped entry anywhere adds its current
 `executionAsyncId()` to a "served" set. A born-resource whose
 `before`/`promiseResolve` runs without ever appearing in "served"
 escaped unwrapped → warn with the creating edge's name/instance.
-Nested escapes (born inside an escaped callback) are unattributed —
-acceptable for a warning.
+Nested escapes (born inside an escaped callback) are unattributed.
 
-**Placement.** NOT in dive — "imports nothing" stands; `init` fires
-process-wide, so the tax is real while enabled. Adapter-level opt-in
-(`forRoot({ detectEscapes: true })`) or a standalone dev utility, using
-the injected-probe pattern from the stamping entry above. Sync nested
-invocations need nothing: they execute inside the frame, and their
-throws cross the wrap `catch` and pin by design.
-
-**Revisit when.** A consumer reports real escaped-flow bugs that stayed
-invisible, or the ALS-companion bridge lands and wants escape data.
+**What replaced it.** The edge lifecycle hooks API (0.5.0, below):
+dive PUBLISHES enter/leave/settle/recontext, and any subscriber sees an
+escaped callback as a missing continuation — no process-wide hook, no
+async_hooks import, no new dive code. Escapes remain what the charter
+says: the user's instrumentation boundary, documented under
+"Intentionally Not Covered". If a real escaped-flow bug ever bites,
+the answer is better propagation ergonomics (wrapArgs already chains to
+any depth), never scheduler surveillance.
 
 ## 2026-08 — Edge lifecycle hooks: emission, not ingestion (landed, 0.5.0)
 
@@ -252,3 +253,5 @@ means reset); adapter wiring must re-register after it. Construction edges
 lifecycle is the adapter's own mnemonica-hook domain, re-publishing it
 through dive would double-report. Next: the adapter's OTel provider
 subscribes here and spans every wrapped call.
+(Landed in @mnemonica/nestjs 0.6.0 as DiveOtelProvider — spans keyed on
+edge id, parented on dive's own parentage, async spans end at settle.)

@@ -23,6 +23,7 @@ import {
 	wrap,
 	current,
 	getFlow,
+	getTrace,
 	getErrorInstance,
 	isWrappedFunction,
 	setTraceLimit,
@@ -536,5 +537,50 @@ describe('trace: getFlow target resolution', () => {
 		const fresh = getFlow(ctx);
 		expect(fresh[0].name).not.toBe('MUTATED');
 		expect(fresh[0].status).toBe('ok');
+	});
+});
+
+describe('trace: getTrace dumps the whole ring', () => {
+	beforeEach(() => clear());
+
+	it('returns every retained edge, oldest first, with no target needed', () => {
+		const ctxA = { id: 'a' };
+		const ctxB = { id: 'b' };
+		wrap(function first () { return 1; }, ctxA)();
+		wrap(function second () { return 2; }, ctxB)();
+		wrap(function third () { return 3; }, ctxA)();
+
+		const trace = getTrace();
+		expect(trace.length).toBe(3);
+		expect(trace.map((edge) => edge.name)).toEqual(['first', 'second', 'third']);
+		expect(trace[0].id).toBeLessThan(trace[1].id);
+		expect(trace[1].id).toBeLessThan(trace[2].id);
+	});
+
+	it('is empty at rest on a fresh trace, unlike getFlow which needs a target', () => {
+		expect(getTrace()).toEqual([]);
+		expect(getFlow()).toEqual([]);
+	});
+
+	it('honors the ring limit — evicted edges are gone from the dump', () => {
+		setTraceLimit(2);
+		const ctx = { id: 'bounded' };
+		wrap(function one () { return 1; }, ctx)();
+		wrap(function two () { return 2; }, ctx)();
+		wrap(function three () { return 3; }, ctx)();
+
+		const trace = getTrace();
+		expect(trace.map((edge) => edge.name)).toEqual(['two', 'three']);
+	});
+
+	it('returns copies — mutating the dump does not corrupt the trace', () => {
+		const ctx = { id: 'immutable-dump' };
+		wrap(function fn () { return 1; }, ctx)();
+
+		const trace = getTrace();
+		trace[0].name = 'MUTATED';
+
+		const fresh = getTrace();
+		expect(fresh[0].name).toBe('fn');
 	});
 });

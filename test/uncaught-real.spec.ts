@@ -40,7 +40,9 @@ describe('REAL crash boundary: dive vs ALS (decoupled consumer)', () => {
 		expect(r.alsInHandler).toBeNull(); // ALS: ambient store gone
 		expect(r.diveInHandler).toBe('origin-instance'); // dive: data on the error
 		expect(r.flowKinds).toEqual(['create:Entity', 'method:process']);
-		expect(r.flowStatus).toEqual(['running', 'error']);
+		// create edge is 'ok': construction honestly completed (0.6.1 closes
+		// create edges at postCreation); the method edge carries the error
+		expect(r.flowStatus).toEqual(['ok', 'error']);
 	});
 
 	it('unhandledRejection: dive recovers the data AND the flow; ALS store is gone', () => {
@@ -49,6 +51,6 @@ describe('REAL crash boundary: dive vs ALS (decoupled consumer)', () => {
 		expect(r.alsInHandler).toBeNull();
 		expect(r.diveInHandler).toBe('origin-instance');
 		expect(r.flowKinds).toEqual(['create:Entity', 'method:processAsync']);
-		expect(r.flowStatus).toEqual(['running', 'error']);
+		expect(r.flowStatus).toEqual(['ok', 'error']);
 	});
 });

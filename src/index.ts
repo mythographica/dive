@@ -822,7 +822,15 @@ export function recordCreation (name: string, instance: object, parent?: object)
 	} else if (activeDepth > 0 && cursor !== null) {
 		parentId = cursor;
 	}
-	recordEdge(KIND_CREATE, name || ANONYMOUS, instance, parentId);
+	const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, instance, parentId);
+	if (edge) {
+		// recordCreation fires at postCreation: the construction HAS completed.
+		// 'running' means genuinely unsettled — a finished construction must not
+		// wear it. Duration is unmeasured at this level (the hook moment IS the
+		// completion), so 0, mirroring recordCreationError.
+		edge.status = STATUS_OK;
+		edge.duration = 0;
+	}
 	enterContext(instance);
 }
 

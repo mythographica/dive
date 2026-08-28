@@ -51,7 +51,11 @@ describe('trace: construction edges follow the data flow', () => {
 		expect(flow[0].name).toBe('Root');
 		expect(flow[0].instance).toBe(instance);
 		expect(flow[0].parentId).toBeNull();
-		expect(flow[0].status).toBe('running'); // create edges are not completed by a call
+		// recordCreation fires at postCreation — the construction HAS completed,
+		// so the edge closes immediately ('ok', unmeasured duration: 0);
+		// 'running' is reserved for genuinely unsettled async work.
+		expect(flow[0].status).toBe('ok');
+		expect(flow[0].duration).toBe(0);
 	});
 
 	it('a subtype creation parents on the PARENT INSTANCE story, not on whatever ran last', () => {

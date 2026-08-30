@@ -7,6 +7,9 @@
  *   leave     → the sync close, with what the wrap produced
  *   settle    → when a tapped promise chain closes (distinct from leave)
  *   recontext → a re-wrap handoff, linking old story to new
+ *   create    → OPT-IN: a construction edge via recordCreation/
+ *               recordCreationError; deliberately NOT enter (the adapter owns
+ *               that lifecycle — enter would double-report there)
  *
  * Containment: a throwing subscriber degrades its own observability, never
  * the trace. clear() wipes subscribers — they must re-register after it.
@@ -19,10 +22,13 @@ import {
 	unregisterHook,
 	clear,
 	setTraceLimit,
+	recordCreation,
+	recordCreationError,
 	type DiveEnterPayload,
 	type DiveLeavePayload,
 	type DiveSettlePayload,
 	type DiveRecontextPayload,
+	type DiveCreatePayload,
 	type FlowEdge,
 } from '../src/index.js';
 
@@ -375,6 +381,107 @@ describe('registerHook: containment and lifecycle', () => {
 		const result = wrapped();
 
 		expect(result).toBe(1);
+		expect(fired).toBe(0);
+	});
+});
+
+describe('registerHook: create (opt-in construction edges)', () => {
+	beforeEach(() => clear());
+
+	it('fires on recordCreation with the finalized edge and no error', () => {
+		const seen: DiveCreatePayload[] = [];
+		registerHook('create', (payload) => {
+			seen.push(payload);
+		});
+
+		const instance = { name: 'inst' };
+		recordCreation('MyType', instance);
+
+		expect(seen.length).toBe(1);
+		expect(seen[0].edge.name).toBe('MyType');
+		expect(seen[0].edge.kind).toBe('create');
+		expect(seen[0].edge.status).toBe('ok');
+		expect(seen[0].edge.duration).toBe(0);
+		expect(seen[0].edge.instance).toBe(instance);
+		expect(seen[0].error).toBeUndefined();
+	});
+
+	it('carries the data-flow parentage of the construction', () => {
+		const seen: DiveCreatePayload[] = [];
+		registerHook('create', (payload) => {
+			seen.push(payload);
+		});
+
+		const parentInst = { name: 'parent' };
+		const childInst = { name: 'child' };
+		recordCreation('Parent', parentInst);
+		recordCreation('Child', childInst, parentInst);
+
+		expect(seen.length).toBe(2);
+		expect(seen[1].edge.parentId).toBe(seen[0].edge.id);
+	});
+
+	it('does NOT fire as enter — the adapter owns the construction domain', () => {
+		let entered = 0;
+		registerHook('enter', () => {
+			entered++;
+		});
+
+		recordCreation('MyType', { name: 'inst' });
+
+		expect(entered).toBe(0);
+	});
+
+	it('fires on recordCreationError with the error pinned and set', () => {
+		const seen: DiveCreatePayload[] = [];
+		registerHook('create', (payload) => {
+			seen.push(payload);
+		});
+
+		const failure = new Error('boom');
+		recordCreationError('BrokenType', failure);
+
+		expect(seen.length).toBe(1);
+		expect(seen[0].edge.name).toBe('BrokenType');
+		expect(seen[0].edge.kind).toBe('create');
+		expect(seen[0].edge.status).toBe('error');
+		expect(seen[0].error).toBe(failure);
+	});
+
+	it('the returned unregister function detaches the subscriber', () => {
+		let fired = 0;
+		const unregister = registerHook('create', () => {
+			fired++;
+		});
+
+		recordCreation('MyType', { name: 'a' });
+		unregister();
+		recordCreation('MyType', { name: 'b' });
+
+		expect(fired).toBe(1);
+	});
+
+	it('clear() wipes the subscribers', () => {
+		let fired = 0;
+		registerHook('create', () => {
+			fired++;
+		});
+
+		clear();
+		recordCreation('MyType', { name: 'inst' });
+
+		expect(fired).toBe(0);
+	});
+
+	it('no create event fires when the trace is disabled (traceLimit 0)', () => {
+		setTraceLimit(0);
+		let fired = 0;
+		registerHook('create', () => {
+			fired++;
+		});
+
+		recordCreation('MyType', { name: 'inst' });
+
 		expect(fired).toBe(0);
 	});
 });

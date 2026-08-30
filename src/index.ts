@@ -19,7 +19,7 @@
  *   dive.getTrace()               → the whole retained trace (copies), oldest first
  *   dive.getErrorInstance(error)  → the data pinned to an error
  *   dive.setTraceLimit(n)         → ring-buffer size for the trace (0 disables recording)
- *   dive.registerHook(event, cb)  → subscribe to edge lifecycle: enter | leave | settle | recontext
+ *   dive.registerHook(event, cb)  → subscribe to edge lifecycle: enter | leave | settle | recontext | create
  *   dive.unregisterHook(ev, cb)   → detach an exact subscriber by reference
  *   dive.clear()                  → reset everything (testing)
  *
@@ -105,13 +105,21 @@ interface DiveArgHolder { context: object | undefined; used: boolean; }
  *               done": result on resolution, error on rejection.
  *   recontext — a re-wrap handoff: the callback changed ownership, payload
  *               links the old context's story to the new one.
+ *   create    — OPT-IN, off the default four: a construction edge recorded
+ *               via recordCreation/recordCreationError. Deliberately NOT an
+ *               'enter' — that lifecycle is the adapter's own mnemonica-hook
+ *               domain, and re-publishing it as enter would double-report
+ *               there. A distinct event lets a third-party subscriber (one
+ *               that is NOT the adapter — e.g. the strategy trace-push
+ *               channel) follow constructions without touching the adapter
+ *               contract. error is set on the recordCreationError path.
  *
  * Hooks fire only when an edge is recorded: with traceLimit 0 there is nothing
  * to observe and no event fires. Dispatch cost when unsubscribed is one length
  * check per edge; subscriber exceptions are contained per-subscriber — a
  * throwing hook degrades its own observability, never the trace.
  */
-export type DiveHookEvent = 'enter' | 'leave' | 'settle' | 'recontext';
+export type DiveHookEvent = 'enter' | 'leave' | 'settle' | 'recontext' | 'create';
 
 export interface DiveEnterPayload {
 	edge : FlowEdge;
@@ -136,8 +144,13 @@ export interface DiveRecontextPayload {
 	context         : object | undefined;
 }
 
+export interface DiveCreatePayload {
+	edge  : FlowEdge;
+	error : unknown;
+}
+
 export type DiveHookPayload =
-	DiveEnterPayload | DiveLeavePayload | DiveSettlePayload | DiveRecontextPayload;
+	DiveEnterPayload | DiveLeavePayload | DiveSettlePayload | DiveRecontextPayload | DiveCreatePayload;
 
 type DiveHook<P> = (payload: P) => void;
 
@@ -146,6 +159,7 @@ const hooks: Record<DiveHookEvent, Array<DiveHook<DiveHookPayload>>> = {
 	leave     : [],
 	settle    : [],
 	recontext : [],
+	create    : [],
 };
 
 /**
@@ -156,6 +170,7 @@ export function registerHook (event: 'enter', hook: DiveHook<DiveEnterPayload>):
 export function registerHook (event: 'leave', hook: DiveHook<DiveLeavePayload>): () => void;
 export function registerHook (event: 'settle', hook: DiveHook<DiveSettlePayload>): () => void;
 export function registerHook (event: 'recontext', hook: DiveHook<DiveRecontextPayload>): () => void;
+export function registerHook (event: 'create', hook: DiveHook<DiveCreatePayload>): () => void;
 export function registerHook (event: DiveHookEvent, hook: (...args: never[]) => void): () => void {
 	const subscribers = hooks[event];
 	// The public overloads narrow the payload per event; internally every
@@ -184,6 +199,7 @@ export function unregisterHook (event: 'enter', hook: DiveHook<DiveEnterPayload>
 export function unregisterHook (event: 'leave', hook: DiveHook<DiveLeavePayload>): void;
 export function unregisterHook (event: 'settle', hook: DiveHook<DiveSettlePayload>): void;
 export function unregisterHook (event: 'recontext', hook: DiveHook<DiveRecontextPayload>): void;
+export function unregisterHook (event: 'create', hook: DiveHook<DiveCreatePayload>): void;
 export function unregisterHook (event: DiveHookEvent, hook: (...args: never[]) => void): void {
 	const stored = hook as DiveHook<DiveHookPayload>;
 	detachHook(event, stored);
@@ -242,6 +258,15 @@ function emitRecontext (
 		return;
 	}
 	const payload: DiveRecontextPayload = { edge, fn, previousContext, context };
+	dispatchHook(subscribers, payload);
+}
+
+function emitCreate (edge: FlowEdge, error: unknown): void {
+	const subscribers = hooks.create;
+	if (subscribers.length === 0) {
+		return;
+	}
+	const payload: DiveCreatePayload = { edge, error };
 	dispatchHook(subscribers, payload);
 }
 
@@ -830,6 +855,10 @@ export function recordCreation (name: string, instance: object, parent?: object)
 		// completion), so 0, mirroring recordCreationError.
 		edge.status = STATUS_OK;
 		edge.duration = 0;
+		// Opt-in 'create', NOT 'enter': the adapter owns this lifecycle via
+		// mnemonica's hooks; enter would double-report there (see the event's
+		// doc above).
+		emitCreate(edge, undefined);
 	}
 	enterContext(instance);
 }
@@ -856,6 +885,11 @@ export function recordCreationError (name: string, errored: unknown, parent?: ob
 			edge.duration = 0;
 		}
 		pinError(errored, edge, parent);
+		if (edge) {
+			// Emitted after pinError so subscribers see the failure already
+			// pinned; same opt-in 'create' event as recordCreation.
+			emitCreate(edge, errored);
+		}
 	}
 	if (errored) {
 		enterContext(errored as object);
@@ -975,4 +1009,5 @@ export function clear (): void {
 	hooks.leave.length = 0;
 	hooks.settle.length = 0;
 	hooks.recontext.length = 0;
+	hooks.create.length = 0;
 }

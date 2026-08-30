@@ -360,6 +360,12 @@ Events:
 - **`recontext`** — a re-wrap handoff: the callback changed ownership, and the
   payload (`fn`, `previousContext`, `context`, plus the handoff edge) links the
   old context's story to the new one.
+- **`create`** — *opt-in*: a construction edge recorded via
+  `recordCreation`/`recordCreationError`. Deliberately **not** an `enter` —
+  that lifecycle is the adapter's own mnemonica-hook domain, and
+  re-publishing it as `enter` would double-report there. `create` exists for
+  third-party subscribers that are **not** the adapter; `error` is set on the
+  `recordCreationError` path.
 
 Hooks fire only when an edge is recorded — with `setTraceLimit(0)` no event
 fires. Dispatch cost when nobody is subscribed is one length check per edge.

@@ -255,3 +255,20 @@ through dive would double-report. Next: the adapter's OTel provider
 subscribes here and spans every wrapped call.
 (Landed in @mnemonica/nestjs 0.6.0 as DiveOtelProvider — spans keyed on
 edge id, parented on dive's own parentage, async spans end at settle.)
+
+## 2026-08-30 — Opt-in `create` event for construction edges (landed, approved by Viktor)
+
+**Decision.** `registerHook` gains a fifth event, `create`, fired from
+`recordCreation`/`recordCreationError` after the edge is finalized (and,
+on the error path, after `pinError` — subscribers see the failure pinned).
+Payload: `{ edge, error }`, `error` set only on the error path.
+
+**Why a DISTINCT event, not `enter`.** The 0.5.0 silence on construction
+edges guarded the ADAPTER from double-reporting: it already owns that
+lifecycle via mnemonica's hooks. But a third-party subscriber that is NOT
+the adapter (the strategy trace-push channel, landed the same day) cannot
+see creation edges otherwise — mnemonica hooks register per-type, there is
+no global hook point to attach to from outside. The adapter never
+subscribes to `create`, so nothing double-reports; the opt-in keeps the
+0.5.0 guarantee intact while opening the channel to non-adapter
+observers. Unsubscribed cost stays one length check per edge.

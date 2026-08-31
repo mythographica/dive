@@ -10,6 +10,8 @@ instances, errors carry their data, and the trace ring records what ran
 (create/call edges, status, duration, parentage). The design decisions and
 their reasons live in [`DECISIONS.md`](./DECISIONS.md) — read it before
 changing behavior; entries there are settled, not suggestions.
+[`SKILL.md`](./SKILL.md) is the wiring guide: where wraps must be placed
+(entry points, detach points), the context rule, and the probed limits.
 
 ## Build & test
 

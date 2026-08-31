@@ -421,6 +421,16 @@ export function isWrappedFunction (value: unknown): boolean {
  */
 const SELF_PATH = import.meta.url.replace(/^file:\/\//, '');
 
+// Frames may arrive SOURCE-MAPPED (node --enable-source-maps): they then
+// point at dive's own src/*.ts, not build/index.js, and an exact SELF_PATH
+// match misses them — dive's internal wrap frame leaks as the callsite.
+// Skip dive's own src/ and build/ trees (NOT the whole package root:
+// in-repo test fixtures live under it, consumers never do).
+const SELF_DIRS = [
+	SELF_PATH.replace(/\/build\/index\.js$/, '/build/'),
+	SELF_PATH.replace(/\/build\/index\.js$/, '/src/'),
+];
+
 // V8 stack frame tail: "    at fn (file:line:col)" or "    at file:line:col"
 const CALLSITE_FRAME = /\(?((?:file:\/\/)?[^()\s]+):(\d+):(\d+)\)?\s*$/;
 
@@ -446,7 +456,7 @@ function captureCallsite (): string | undefined {
 		if (file.startsWith('node:')) {
 			continue;
 		}
-		if (file === SELF_PATH) {
+		if (file === SELF_PATH || SELF_DIRS.some((dir) => file.startsWith(dir))) {
 			continue;
 		}
 		const result = `${file}:${match[2]}:${match[3]}`;

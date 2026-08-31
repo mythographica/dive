@@ -11,6 +11,9 @@
  * wrapped, not where it was re-rooted.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
 	wrap,
@@ -120,5 +123,24 @@ describe('bulb identity: callsite capture', () => {
 		const first = (wrapped as unknown as Record<symbol, unknown>)[SymbolDiveCallsite];
 		const second = (rerooted as unknown as Record<symbol, unknown>)[SymbolDiveCallsite];
 		expect(second).toBe(first);
+	});
+});
+
+describe('callsite under --enable-source-maps (child process on build/)', () => {
+	// NOTE: the child imports the compiled build/, so `npm run build` must be
+	// current for this test to reflect src changes (pretest runs tsc).
+	it('skips dive-internal frames that resolve to src/*.ts via the inline map', () => {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const childScript = path.join(here, 'fixtures', 'callsite-mapped-child.mjs');
+		const out = execFileSync(
+			process.execPath,
+			['--enable-source-maps', childScript],
+			{ encoding : 'utf8' },
+		);
+		const { name } = JSON.parse(out) as { name : string };
+		// the caption must be the CHILD's callsite, not dive's own source
+		expect(name).toMatch(/callsite-mapped-child\.mjs:\d+:\d+$/);
+		expect(name).not.toContain('dive/src');
+		expect(name).not.toContain('dive/build');
 	});
 });

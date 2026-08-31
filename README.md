@@ -207,17 +207,32 @@ events):
 | `recordCreationError(name, error, parent?)` | construction failed — error pinned to the failed edge |
 | `isWrappedFunction(fn)` | guard against double-wrapping |
 
-### `wrap(fn, context?)`
+### `wrap(fn, context?)` / `wrap(fn, label?)` / `wrap(fn, context, label)`
 
 ```typescript
 wrap<T extends (...args: unknown[]) => unknown>(
   fn: T,
-  context?: object
+  context?: object,
+  label?: string
 ): T;
 ```
 
 Capture context at wrap-time (explicit, or the current ambient context),
 restore it at invocation-time, and record the invocation as a trace edge.
+
+The optional `label` is a grouping tag for tooling (one label may group many
+names). Every wrap also captures its **callsite** (`file:line:col`, plain
+path) once at wrap time — the runtime half of the join into tactica's
+`eds.json` probe registry, which uses the same location format. Edges carry
+both as `edge.label` / `edge.callsite`, and the edge `name` follows the
+caption cascade:
+
+- label + named fn → `label:name`
+- label + anonymous fn → the callsite (the label survives on `edge.label`)
+- no label → `fn.name`, falling back to the callsite, then `'anonymous'`
+
+Re-rooting (`wrap(w, differentContext)`) preserves the ORIGINAL wrap's
+label/callsite: a bulb's identity is where it was first wrapped.
 
 Handles `new` calls (via `Reflect.construct`), wraps returned functions,
 wraps function arguments (recursively, to any depth), wraps Promise-resolved

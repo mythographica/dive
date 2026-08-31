@@ -14,6 +14,8 @@
  *
  * Public API:
  *   dive.wrap(fn, context?)       → capture context now, restore + record at invocation
+ *   dive.wrap(fn, label?)         → same, with a grouping label for tooling
+ *   dive.wrap(fn, context, label) → both
  *   dive.current()                → the instance executing right now
  *   dive.getFlow(target?)         → execution branch: Error | instance | current cursor
  *   dive.getTrace()               → the whole retained trace (copies), oldest first
@@ -54,6 +56,13 @@ const SymbolDiveArgHolder = Symbol.for('mnemonica.dive.argHolder');
 // wrapper always knows what it wraps and whose story it tells.
 const SymbolDiveOriginal = Symbol.for('mnemonica.dive.original');
 const SymbolDiveContext = Symbol.for('mnemonica.dive.context');
+// Identity of a wrap SITE (not the wrapped fn): the callsite is captured once
+// per wrap and the label is the user's optional grouping tag. Together with the
+// caption they are the runtime half of the AoT join — tactica's eds.json
+// records wrap entries in the same file:line:col format.
+const SymbolDiveCallsite = Symbol.for('mnemonica.dive.callsite');
+const SymbolDiveLabel = Symbol.for('mnemonica.dive.label');
+const SymbolDiveCaption = Symbol.for('mnemonica.dive.caption');
 
 // The domain vocabulary, defined once — a single source of truth for every
 // status, kind, and fallback name the trace can carry.
@@ -80,6 +89,11 @@ export interface FlowEdge {
 	ts       : number;
 	duration : number | undefined;
 	status   : FlowStatus;
+	/** Grouping label from wrap(fn, label); undefined when unlabeled */
+	label?    : string;
+	/** file:line:col of the wrap() site (plain path, 1-based) — the join key
+	 *  into tactica's eds.json probe registry */
+	callsite? : string;
 }
 
 // A constructor arg wrapped at preCreation carries a MUTABLE context holder so
@@ -401,6 +415,71 @@ export function isWrappedFunction (value: unknown): boolean {
 }
 
 /**
+ * This module's own file as a plain path — used to skip dive-internal frames
+ * when capturing a wrap callsite. dive ships ESM, so import.meta.url always
+ * exists here.
+ */
+const SELF_PATH = import.meta.url.replace(/^file:\/\//, '');
+
+// V8 stack frame tail: "    at fn (file:line:col)" or "    at file:line:col"
+const CALLSITE_FRAME = /\(?((?:file:\/\/)?[^()\s]+):(\d+):(\d+)\)?\s*$/;
+
+/**
+ * Capture the first USERLAND stack frame at wrap time — once per wrap, never
+ * per invocation. Normalised to a plain `file:line:col` path, the same format
+ * tactica writes into eds.json locations, so a runtime edge joins the AoT
+ * probe registry by exact string match.
+ */
+function captureCallsite (): string | undefined {
+	const probe = new Error();
+	const { stack } = probe;
+	if (!stack) {
+		return undefined;
+	}
+	const frames = stack.split('\n').slice(1);
+	for (const frame of frames) {
+		const match = frame.match(CALLSITE_FRAME);
+		if (!match) {
+			continue;
+		}
+		const file = match[1].replace(/^file:\/\//, '');
+		if (file.startsWith('node:')) {
+			continue;
+		}
+		if (file === SELF_PATH) {
+			continue;
+		}
+		const result = `${file}:${match[2]}:${match[3]}`;
+		return result;
+	}
+	return undefined;
+}
+
+/**
+ * Bulb caption cascade:
+ *   label + named fn     → `label:name`  (one label groups many names)
+ *   label + anonymous fn → callsite      (a bare label cannot tell anonymous
+ *                          wraps apart; the label survives on edge.label)
+ *   no label             → fn.name, falling back to callsite, then 'anonymous'
+ */
+function computeCaption (
+	fn: (...args: unknown[]) => unknown,
+	label: string | undefined,
+	callsite: string | undefined
+): string {
+	const name = (fn as { name?: string }).name;
+	if (label !== undefined) {
+		if (name) {
+			return `${label}:${name}`;
+		}
+		const result = callsite || ANONYMOUS;
+		return result;
+	}
+	const result = name || callsite || ANONYMOUS;
+	return result;
+}
+
+/**
  * Tap a promise result so the edge tells the truth about the async work:
  *
  *   - the edge closes ('ok' + full-lifetime duration) when the WHOLE chain
@@ -466,9 +545,21 @@ function tapPromise (
  */
 export function wrap<T extends (...args: unknown[]) => unknown> (
 	fn: T,
-	context?: object
+	label?: string
+): T;
+export function wrap<T extends (...args: unknown[]) => unknown> (
+	fn: T,
+	context?: object,
+	label?: string
+): T;
+export function wrap<T extends (...args: unknown[]) => unknown> (
+	fn: T,
+	contextOrLabel?: object | string,
+	label?: string
 ): T {
-	const result = wrapEntry(fn, context, false);
+	const context = typeof contextOrLabel === 'string' ? undefined : contextOrLabel;
+	const effectiveLabel = typeof contextOrLabel === 'string' ? contextOrLabel : label;
+	const result = wrapEntry(fn, context, false, effectiveLabel);
 	return result;
 }
 
@@ -482,10 +573,11 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
 function wrapEntry<T extends (...args: unknown[]) => unknown> (
 	fn: T,
 	context: object | undefined,
-	auto: boolean
+	auto: boolean,
+	label?: string
 ): T {
 	if (!isWrappedFunction(fn)) {
-		const result = wrapInternal(fn, context);
+		const result = wrapInternal(fn, context, label);
 		return result;
 	}
 
@@ -507,8 +599,17 @@ function wrapEntry<T extends (...args: unknown[]) => unknown> (
 		return fn;
 	}
 
-	recordHandoff(original, existing, context);
-	const result = wrapInternal(original, context);
+	const rec = fn as unknown as Record<symbol, unknown>;
+	const caption = rec[SymbolDiveCaption] as string | undefined;
+	recordHandoff(original, existing, context, caption);
+	// The re-root preserves the ORIGINAL site's label/callsite: a bulb's
+	// identity is where it was first wrapped, not where it was re-rooted.
+	const result = wrapInternal(
+		original,
+		context,
+		label ?? rec[SymbolDiveLabel] as string | undefined,
+		rec[SymbolDiveCallsite] as string | undefined
+	);
 	return result;
 }
 
@@ -522,14 +623,15 @@ function wrapEntry<T extends (...args: unknown[]) => unknown> (
 function recordHandoff (
 	fn: (...args: unknown[]) => unknown,
 	previousContext: object | undefined,
-	context: object | undefined
+	context: object | undefined,
+	caption?: string
 ): void {
 	let parentId: number | null = null;
 	if (isObjectKey(previousContext)) {
 		const own = latestEdge.get(previousContext);
 		parentId = own !== undefined && edges.has(own) ? own : null;
 	}
-	const name = (fn as { name?: string }).name || ANONYMOUS;
+	const name = caption || (fn as { name?: string }).name || ANONYMOUS;
 	const edge = recordEdge(KIND_RECONTEXT, name, context, parentId);
 	if (edge) {
 		emitRecontext(edge, fn, previousContext, context);
@@ -543,9 +645,13 @@ function recordHandoff (
  */
 function wrapInternal<T extends (...args: unknown[]) => unknown> (
 	fn: T,
-	context: object | undefined
+	context: object | undefined,
+	label?: string,
+	callsiteOverride?: string
 ): T {
 	const capturedContext = context ?? lastContext;
+	const callsite = callsiteOverride ?? captureCallsite();
+	const caption = computeCaption(fn, label, callsite);
 
 	const wrapped = function (this: unknown, ...args: unknown[]) {
 		const isConstructor = new.target !== undefined;
@@ -555,11 +661,17 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 
 		const edge = recordEdge(
 			isConstructor ? KIND_CONSTRUCT : KIND_CALL,
-			(fn as { name?: string }).name || ANONYMOUS,
+			caption,
 			capturedContext,
 			executionParent(capturedContext)
 		);
 		if (edge) {
+			if (label !== undefined) {
+				edge.label = label;
+			}
+			if (callsite !== undefined) {
+				edge.callsite = callsite;
+			}
 			cursor = edge.id;
 			emitEnter(edge, args);
 		}
@@ -623,7 +735,7 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 	wrapped.prototype = fn.prototype;
 
 	Object.defineProperty(wrapped, FN_NAME, {
-		value        : `diveWrapped:${(fn as { name?: string }).name}`,
+		value        : `diveWrapped:${caption}`,
 		configurable : true,
 	});
 
@@ -642,6 +754,25 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 
 	Object.defineProperty(wrapped, SymbolDiveContext, {
 		value        : capturedContext,
+		configurable : false,
+		enumerable   : false,
+	});
+
+	// Wrap-site identity for re-root preservation and tooling introspection
+	Object.defineProperty(wrapped, SymbolDiveCallsite, {
+		value        : callsite,
+		configurable : false,
+		enumerable   : false,
+	});
+
+	Object.defineProperty(wrapped, SymbolDiveLabel, {
+		value        : label,
+		configurable : false,
+		enumerable   : false,
+	});
+
+	Object.defineProperty(wrapped, SymbolDiveCaption, {
+		value        : caption,
 		configurable : false,
 		enumerable   : false,
 	});

@@ -1,0 +1,6 @@
+# build/ is gitignored but publish ships it from disk — rebuild it
+# whenever src/ changes are staged, so a later publish from this tree
+# ships output matching the last commit (same guard as tactica's)
+if git diff --cached --name-only | grep -q '^src/'; then
+	npm run build
+fi

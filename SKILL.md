@@ -39,6 +39,19 @@ const outer = wrap(function outer () { inner(); }, ctx);
 const lonely = wrap(function inner () { ... });
 ```
 
+**Always pass the context at entry points — the ambient fallback is
+best-effort, never authoritative.** A contextless `wrap(fn)` falls back to
+`lastContext`: a module-global, newest-wins switcher moved by every
+construction and lifecycle hook. It is truthful only when instrumentation is
+complete AND the flow is fully synchronous; concurrency, out-of-band
+construction (REPL, eval, the strategy WS channel), or a mid-flight
+reassignment can all make a contextless edge wear a FOREIGN instance.
+Attribution must be true or absent, never guessed — so entry points pass
+their context explicitly, and edges record how the instance was attributed
+(`instanceSource: 'explicit' | 'ambient'`) so consumers can distrust ambient
+attributions. See `reports/lastcontext-ambiguity.md` for the observed
+failure and the design space.
+
 ## Where to wrap
 
 1. **Entry points — usually already covered.** In NestJS the adapter's

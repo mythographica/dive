@@ -80,6 +80,16 @@ const FN_NAME = 'name';
 export type FlowKind = 'create' | 'call' | 'construct' | 'method' | 'recontext';
 export type FlowStatus = 'running' | 'ok' | 'error';
 
+/**
+ * How an edge's instance was attributed. 'explicit' — the caller passed the
+ * context (or it is the method receiver / the constructed instance);
+ * 'ambient' — wrap() fell back to lastContext, a newest-wins ambient that is
+ * truthful only for fully-instrumented synchronous flows. Consumers
+ * (visualization) should distrust 'ambient': attribution must be true or
+ * absent, never guessed. Undefined when the edge carries no instance.
+ */
+export type InstanceSource = 'explicit' | 'ambient';
+
 export interface FlowEdge {
 	id       : number;
 	parentId : number | null;
@@ -90,10 +100,12 @@ export interface FlowEdge {
 	duration : number | undefined;
 	status   : FlowStatus;
 	/** Grouping label from wrap(fn, label); undefined when unlabeled */
-	label?    : string;
+	label?          : string;
 	/** file:line:col of the wrap() site (plain path, 1-based) — the join key
 	 *  into tactica's eds.json probe registry */
-	callsite? : string;
+	callsite?       : string;
+	/** explicit vs ambient attribution — see InstanceSource */
+	instanceSource? : InstanceSource;
 }
 
 // A constructor arg wrapped at preCreation carries a MUTABLE context holder so
@@ -644,6 +656,10 @@ function recordHandoff (
 	const name = caption || (fn as { name?: string }).name || ANONYMOUS;
 	const edge = recordEdge(KIND_RECONTEXT, name, context, parentId);
 	if (edge) {
+		// The context arrives as an argument — attribution is never ambient here
+		if (isObjectKey(context)) {
+			edge.instanceSource = 'explicit';
+		}
 		emitRecontext(edge, fn, previousContext, context);
 	}
 }
@@ -660,6 +676,10 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 	callsiteOverride?: string
 ): T {
 	const capturedContext = context ?? lastContext;
+	// Provenance, decided at wrap time: an explicitly passed context is trusted;
+	// the lastContext fallback is newest-wins ambient — truthful only for
+	// fully-instrumented synchronous flows (see reports/lastcontext-ambiguity.md)
+	const capturedSource: InstanceSource = context !== undefined ? 'explicit' : 'ambient';
 	const callsite = callsiteOverride ?? captureCallsite();
 	const caption = computeCaption(fn, label, callsite);
 
@@ -681,6 +701,9 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 			}
 			if (callsite !== undefined) {
 				edge.callsite = callsite;
+			}
+			if (capturedContext !== undefined) {
+				edge.instanceSource = capturedSource;
 			}
 			cursor = edge.id;
 			emitEnter(edge, args);
@@ -914,6 +937,8 @@ export function wrapInstanceMethods (instance: object): void {
 
 			const edge = recordEdge(KIND_METHOD, name, context, executionParent(context));
 			if (edge) {
+				// The receiver IS the context — never ambient
+				edge.instanceSource = 'explicit';
 				cursor = edge.id;
 				emitEnter(edge, args);
 			}
@@ -996,6 +1021,8 @@ export function recordCreation (name: string, instance: object, parent?: object)
 		// completion), so 0, mirroring recordCreationError.
 		edge.status = STATUS_OK;
 		edge.duration = 0;
+		// The constructed instance arrives as an argument — never ambient
+		edge.instanceSource = 'explicit';
 		// Opt-in 'create', NOT 'enter': the adapter owns this lifecycle via
 		// mnemonica's hooks; enter would double-report there (see the event's
 		// doc above).
@@ -1024,6 +1051,10 @@ export function recordCreationError (name: string, errored: unknown, parent?: ob
 		const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, parent, parentId);
 		if (edge) {
 			edge.duration = 0;
+			// The surviving parent arrives as an argument — never ambient
+			if (isObjectKey(parent)) {
+				edge.instanceSource = 'explicit';
+			}
 		}
 		pinError(errored, edge, parent);
 		if (edge) {

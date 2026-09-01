@@ -219,6 +219,9 @@ wrap<T extends (...args: unknown[]) => unknown>(
 
 Capture context at wrap-time (explicit, or the current ambient context),
 restore it at invocation-time, and record the invocation as a trace edge.
+Which of the two happened is recorded on the edge as `instanceSource`
+(`'explicit' | 'ambient'`): the ambient fallback is newest-wins and
+best-effort, so consumers can distrust it under concurrency.
 
 The optional `label` is a grouping tag for tooling (one label may group many
 names). Every wrap also captures its **callsite** (`file:line:col`, plain
@@ -294,6 +297,13 @@ interface FlowEdge {
   // ms, set when the invocation completes
   duration: number | undefined;
   status: 'running' | 'ok' | 'error';
+  // grouping tag / wrap site, when given
+  label?: string;
+  callsite?: string;
+  // how the instance was attributed: passed by the caller, or captured
+  // from the newest-wins ambient (best-effort — distrust it under
+  // concurrency); undefined when the edge carries no instance
+  instanceSource?: 'explicit' | 'ambient';
 }
 ```
 

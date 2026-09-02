@@ -1,6 +1,6 @@
 {
 	"name": "@mnemonica/dive",
-	"version": "0.8.3",
+	"version": "0.8.5",
 	"description": "Object-bound context propagation and execution-flow tracing — no ALS, no async_hooks",
 	"type": "module",
 	"main": "./build/index.js",
@@ -21,8 +21,8 @@
 		"build": "tsc",
 		"build:watch": "tsc --watch",
 		"pretest": "tsc",
-		"test": "vitest run",
-		"test:cov": "vitest run --coverage",
+		"test": "NODE_OPTIONS=--expose-gc vitest run",
+		"test:cov": "NODE_OPTIONS=--expose-gc vitest run --coverage",
 		"test:watch": "vitest",
 		"prepublishOnly": "tsc"
 	},

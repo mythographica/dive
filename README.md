@@ -332,16 +332,70 @@ The data pinned to an error. The error is pinned **once**, at the deepest
 wrapped boundary it passed through — so this points at the failure site,
 not at some outer re-throw.
 
+### `getRunningEdges()`
+
+```typescript
+getRunningEdges(): FlowEdge[];
+```
+
+The edges still `running` right now — the unfinished fibers. This is the
+suspect set for `uncaughtException` / `unhandledRejection` attribution,
+queryable in O(1) without scanning the ring. Copies, same semantics as
+`getTrace()`. Entries are born at edge creation and removed at settle
+(sync return, promise settle, error mark), so the store is bounded by
+true concurrency and leaks nothing when nobody consumes it. Under a
+bounded ring it also doubles as eviction-immune storage for unfinished
+fibers. See `reports/running-edges-store-design.md`.
+
 ### `setTraceLimit(limit)`
 
 ```typescript
-// default: 1024
+// default: Number.MAX_SAFE_INTEGER (unbounded since 2026-09-02 — retention
+// is meant to be GC-driven via weak instance refs; pass 1024 for the
+// pre-flip behavior). Safe by default because weak instance refs are the
+// default mode; opting OUT of weak refs (setWeakInstanceRefs(false)) with
+// an unbounded ring pins every instance it records — don't do that in
+// production.
 setTraceLimit(limit: number): void;
 ```
 
 Sets the ring-buffer size of the trace. `0` disables recording (context
 switching still works; `getFlow()` returns empty branches). Shrinking evicts
 the oldest edges immediately.
+
+### `setWeakInstanceRefs(enable)` / `getCollectedInstanceCount()`
+
+```typescript
+// default: WeakRef (since 2026-09-02) — pass false to pin instances strongly
+setWeakInstanceRefs(enable: boolean): void;
+getCollectedInstanceCount(): number;
+```
+
+Weak mode stores `edge.instance` as a `WeakRef` behind a getter and
+registers each instance with a `FinalizationRegistry`: when GC collects an
+instance, its edges are marked `instanceCollected: true` and the counter
+advances — a finished fiber becomes observable. The edge skeleton (ids,
+name, kind, status) stays in the ring; only the payload is released.
+Measured on the chaos fixture (60k requests, unbounded ring): strong mode
+pinned ~6.7KB/request with zero release after load; weak mode released
+all 60000 payloads and ran ~70% faster. Trade-off: `getFlow()` /
+`getErrorInstance()` on an old trace may deref to `undefined` — snapshot
+instance data at settle/error time if you need postmortem payloads.
+
+**Payload survival is per-object, not per-fiber.** A fiber that carries
+ONE context instance through all its edges (the common case — one DATA
+flowing through wraps) keeps every edge's payload alive while ANY single
+reference to that instance exists anywhere: a pending timer's closure, a
+suspended `await` frame, the unwinding crash stack. Edges pointing at
+*different* instances have independent fates. Skeletons are always held
+strongly by the ring — GC never touches them.
+
+**Crash-time delivery contract:** at `uncaughtException` /
+`unhandledRejection`, the crashing fiber's payloads ARE alive (the crash
+path itself roots them) — but only until the handler returns. So extract
+and ship INSIDE the handler, synchronously; a consumer that polls later
+may find payloads collected. The ring is the live view; your crash
+handler's export (Jaeger, mnemographica) is the postmortem store.
 
 ### `clear()`
 
@@ -699,9 +753,14 @@ designs, and when to revisit them — lives in
 
 The store is four parts (no `async_hooks`):
 
-- `edges` — a `Map<id, FlowEdge>` **ring buffer** (oldest evicted past
-  `traceLimit`, default 1024). Edges hold strong references to their instances
-  until evicted, so the buffer size IS the memory bound.
+- `edges` — a `Map<id, FlowEdge>` ordered by insertion. Since 2026-09-02
+  the default is **unbounded** (`setTraceLimit` opts back into a bounded
+  ring; 1024 was the old default) and instance refs are **weak by
+  default**: `edge.instance` is a `WeakRef` deref and GC reachability is
+  the memory bound, with the `FinalizationRegistry` marking collected
+  instances on their edges. `setWeakInstanceRefs(false)` opts back into
+  strong refs — edges then pin their instances, so bound the ring if you
+  do that.
 - `cursor` — the id of the edge executing right now (`null` at rest), plus
   `activeDepth` tracking how deep we are inside wrapped invocations. Depth
   decides parentage (see "The Execution-Flow Trace").

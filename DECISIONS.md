@@ -272,3 +272,28 @@ no global hook point to attach to from outside. The adapter never
 subscribes to `create`, so nothing double-reports; the opt-in keeps the
 0.5.0 guarantee intact while opening the channel to non-adapter
 observers. Unsubscribed cost stays one length check per edge.
+
+## 2026-09-02 — Weak instance refs landed; ring default unbounded
+
+**Decision.** `setWeakInstanceRefs(true)` stores `edge.instance` as a
+WeakRef behind a getter; a FinalizationRegistry reports each collection
+(`instanceCollected = true` on the live edges, `getCollectedInstanceCount()`
+for observability). The ring default moves from 1024 to
+`Number.MAX_SAFE_INTEGER` (Viktor's call) — retention is meant to be
+GC-driven, not eviction-driven; `setTraceLimit(1024)` restores the old
+bound. Viktor keeps a pre-weak-refs dive on a backup branch for
+reproducing experiment 1; the fixture's ring-experiment script
+(`tactica-nestjs/scripts/ring-experiment.sh`) reproduces both.
+
+**Evidence** (reports/lastcontext-ambiguity.md, experiments 1 & 2, 60k
+requests @ 772→1304 rps): strong+unbounded pins ~6.7KB/request with ZERO
+release after load (438.8MB flat across 13 forced GCs); weak+unbounded
+released all 60000 instance payloads (collected count matched requests
+exactly), ran ~70% faster, floor fell to skeleton metadata only.
+
+**Open tension — RESOLVED same day.** Viktor's call: weak refs are the
+DEFAULT (`setWeakInstanceRefs(false)` opts out). The default pair is now
+weak + unbounded — GC-driven retention end to end. Semantics note for
+consumers: `edge.instance` on an old settled edge may deref to
+`undefined`; snapshot payloads at settle/error time if you need them
+(main.ts already extracts at handler time).

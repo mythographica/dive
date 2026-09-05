@@ -6,3 +6,7 @@ coverage
 .idea
 .npmrc
 build/
+
+# internal agent memory — never published
+plans/
+reports/

@@ -345,7 +345,7 @@ queryable in O(1) without scanning the ring. Copies, same semantics as
 (sync return, promise settle, error mark), so the store is bounded by
 true concurrency and leaks nothing when nobody consumes it. Under a
 bounded ring it also doubles as eviction-immune storage for unfinished
-fibers. See `reports/running-edges-store-design.md`.
+fibers.
 
 ### `setTraceLimit(limit)`
 

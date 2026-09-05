@@ -285,7 +285,7 @@ bound. Viktor keeps a pre-weak-refs dive on a backup branch for
 reproducing experiment 1; the fixture's ring-experiment script
 (`tactica-nestjs/scripts/ring-experiment.sh`) reproduces both.
 
-**Evidence** (reports/lastcontext-ambiguity.md, experiments 1 & 2, 60k
+**Evidence** (the lastContext-ambiguity experiments 1 & 2, 60k
 requests @ 772→1304 rps): strong+unbounded pins ~6.7KB/request with ZERO
 release after load (438.8MB flat across 13 forced GCs); weak+unbounded
 released all 60000 instance payloads (collected count matched requests

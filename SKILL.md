@@ -49,8 +49,7 @@ reassignment can all make a contextless edge wear a FOREIGN instance.
 Attribution must be true or absent, never guessed — so entry points pass
 their context explicitly, and edges record how the instance was attributed
 (`instanceSource: 'explicit' | 'ambient'`) so consumers can distrust ambient
-attributions. See `reports/lastcontext-ambiguity.md` for the observed
-failure and the design space.
+attributions.
 
 ## Where to wrap
 

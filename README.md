@@ -22,23 +22,32 @@ any objects you choose as context. Used with
 [mnemonica](https://www.npmjs.com/package/mnemonica) — the instance-inheritance
 library whose types carry their construction context (data flow) with them —
 it becomes automatic: every constructed instance is its own context. That
-wiring lives in the
-[@mnemonica/nestjs](https://www.npmjs.com/package/@mnemonica/nestjs) adapter
-(`attachHooks`), not in dive itself.
+wiring lives in
+[@mnemonica/otel](https://www.npmjs.com/package/@mnemonica/otel)
+(`attachHooks`), not in dive itself — the NestJS adapter re-exports it.
 
 The ecosystem:
 
 - [mnemonica](https://www.npmjs.com/package/mnemonica) — the core: typed
   instance inheritance, lifecycle hooks, composite error stacks.
+- [@mnemonica/otel](https://www.npmjs.com/package/@mnemonica/otel) — the
+  framework-free Node engine where dive meets mnemonica: `attachHooks()`
+  (the dive ↔ mnemonica lifecycle wiring), OTel providers, the ALS
+  async-flow backbone, the pre-root store.
 - [@mnemonica/nestjs](https://www.npmjs.com/package/@mnemonica/nestjs) — the
-  NestJS adapter: `attachHooks()` (dive ↔ mnemonica lifecycle wiring),
-  module system, pipes, interceptors, Thunderstruck boundary feeding.
+  NestJS adapter layered on otel: module system, pipes, interceptors,
+  Thunderstruck boundary feeding.
 - [typeomatica](https://www.npmjs.com/package/typeomatica) — runtime
   strict-type enforcement for instance fields (Proxy-based). Companion for
   construction-time data integrity.
 - [@mnemonica/tactica](https://www.npmjs.com/package/@mnemonica/tactica) —
   the compile-time side: generates the TypeScript registry so `lookup()` and
   `define()` are fully typed.
+- [@mnemonica/strategy](https://www.npmjs.com/package/@mnemonica/strategy) +
+  [mnemographica](https://github.com/mythographica/mnemographica) — the
+  read-out path: strategy streams the trace out of a running process (WS
+  channel, no CDP needed when the app self-hosts), mnemographica renders it
+  (Live Trace sidebar, 3D trace bulbs).
 
 ---
 
@@ -89,8 +98,8 @@ goes away. A queue consumer running 30 seconds later has **no context**.
 ```javascript
 import { wrap, current } from '@mnemonica/dive';
 import { getFlow, getErrorInstance } from '@mnemonica/dive';
-// the mnemonica ↔ dive wiring lives in the adapter:
-import { attachHooks } from '@mnemonica/nestjs';
+// the mnemonica ↔ dive wiring lives in the observability engine:
+import { attachHooks } from '@mnemonica/otel';
 import { defaultTypes } from 'mnemonica';
 
 // records creation edges, auto-wraps instance methods
@@ -130,12 +139,13 @@ Dive captures context at **wrap-time** and restores + records it at
 # standalone — zero dependencies of any kind
 npm install @mnemonica/dive
 
-# with mnemonica — the adapter carries the lifecycle wiring
-npm install @mnemonica/dive @mnemonica/nestjs mnemonica
+# with mnemonica — the otel package carries the lifecycle wiring
+npm install @mnemonica/dive @mnemonica/otel mnemonica
 ```
 
 Dive has no dependency on mnemonica at all — not even a peer one. The two
-meet only inside `@mnemonica/nestjs`, which depends on both.
+meet inside `@mnemonica/otel` (framework-free) or `@mnemonica/nestjs` (the
+NestJS adapter), which depend on both.
 
 ---
 
@@ -161,7 +171,7 @@ With mnemonica, construction itself becomes the context switch — via the
 adapter's `attachHooks`:
 
 ```typescript
-import { attachHooks } from '@mnemonica/nestjs';
+import { attachHooks } from '@mnemonica/otel';
 import { current } from '@mnemonica/dive';
 import { defaultTypes } from 'mnemonica';
 
@@ -183,13 +193,14 @@ current() === instance; // true
 
 ## API
 
-### `attachHooks(collection)` — moved to `@mnemonica/nestjs`
+### `attachHooks(collection)` — moved to `@mnemonica/otel`
 
-The mnemonica lifecycle wiring is adapter-level code, not engine code. It now
-ships as [`@mnemonica/nestjs`](https://www.npmjs.com/package/@mnemonica/nestjs):
+The mnemonica lifecycle wiring is integration-level code, not engine code. It
+ships in [`@mnemonica/otel`](https://www.npmjs.com/package/@mnemonica/otel) —
+framework-free — and the NestJS adapter re-exports it:
 
 ```typescript
-import { attachHooks } from '@mnemonica/nestjs';
+import { attachHooks } from '@mnemonica/otel';
 attachHooks(collection); // preCreation + postCreation + creationError
 ```
 
@@ -526,7 +537,7 @@ module system, validation pipe, interceptors, and `attachHooks()` (the dive ↔
 mnemonica lifecycle wiring). `MnemonicaModule.forRoot({ thunderstruck: true })`
 activates the whole bundle.
 
-Outside NestJS, call `attachHooks(collection)` from the same package once at
+Outside NestJS, call `attachHooks(collection)` from `@mnemonica/otel` once at
 startup, and every mnemonica instance created while serving a request becomes
 context automatically (the instance **is** the context). At decoupled
 boundaries (queues, timers, emitters), `wrap()` the callback with the
@@ -691,8 +702,9 @@ The contract between runtimes is a **correlation key carried as data**:
    (`new RequestData(dbRecord)`): dive tracking resumes from that point, and
    the uuid links the new flow branch back to the original one.
 3. Across the wire, let the tracer built for it do its job: the
-   `@mnemonica/nestjs` adapter emits OpenTelemetry spans carrying
-   `dive.instance.uuid`, so Jaeger stitches what dive cannot see.
+   `@mnemonica/otel` providers emit OpenTelemetry spans carrying
+   `dive.instance.uuid` (the NestJS adapter wires them in), so Jaeger
+   stitches what dive cannot see.
 
 Where dive differs from ALS is *which* in-process boundary it pins to. ALS
 binds context to the async **resource** chain — ambient, correct only while

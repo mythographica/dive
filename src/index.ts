@@ -512,25 +512,42 @@ export function isWrappedFunction (value: unknown): boolean {
 	return typeof value === 'function' && SymbolDiveWrapped in (value as unknown as Record<symbol, unknown>);
 }
 
-/**
- * This module's own file as a plain path — used to skip dive-internal frames
- * when capturing a wrap callsite. dive ships ESM, so import.meta.url always
- * exists here.
- */
-const SELF_PATH = import.meta.url.replace(/^file:\/\//, '');
-
-// Frames may arrive SOURCE-MAPPED (node --enable-source-maps): they then
-// point at dive's own src/*.ts, not build/index.js, and an exact SELF_PATH
-// match misses them — dive's internal wrap frame leaks as the callsite.
-// Skip dive's own src/ and build/ trees (NOT the whole package root:
-// in-repo test fixtures live under it, consumers never do).
-const SELF_DIRS = [
-	SELF_PATH.replace(/\/build\/index\.js$/, '/build/'),
-	SELF_PATH.replace(/\/build\/index\.js$/, '/src/'),
-];
-
 // V8 stack frame tail: "    at fn (file:line:col)" or "    at file:line:col"
 const CALLSITE_FRAME = /\(?((?:file:\/\/)?[^()\s]+):(\d+):(\d+)\)?\s*$/;
+
+/**
+ * This module's own file as a plain path — used to skip dive-internal frames
+ * when capturing a wrap callsite. The package dual-builds (ESM + CJS) and
+ * import.meta.url does not exist under CommonJS, so the path comes from this
+ * module's own stack frame instead: the first frame of an Error created here
+ * IS this file (ESM: "at file:///…/build/index.js:…", CJS: "at
+ * Object.<anonymous> (/…/build-cjs/index.js:…)").
+ */
+function computeSelfPath (): string {
+	const stack = new Error().stack ?? '';
+	const lines = stack.split('\n');
+	for (const line of lines) {
+		const match = line.match(CALLSITE_FRAME);
+		if (match) {
+			const selfPath = match[1].replace(/^file:\/\//, '');
+			return selfPath;
+		}
+	}
+	// No parseable frame: degrade to "skip nothing" rather than break wrap().
+	const selfPath = '';
+	return selfPath;
+}
+const SELF_PATH = computeSelfPath();
+
+// Frames may arrive SOURCE-MAPPED (node --enable-source-maps): they then
+// point at dive's own src/*.ts, not the shipped build output, and an exact
+// SELF_PATH match misses them — dive's internal wrap frame leaks as the
+// callsite. Skip dive's own src/ and own build-flavor tree (NOT the whole
+// package root: in-repo test fixtures live under it, consumers never do).
+const SELF_DIRS = [
+	SELF_PATH.replace(/\/index\.js$/, '/'),
+	SELF_PATH.replace(/\/build(-cjs)?\/index\.js$/, '/src/'),
+];
 
 /**
  * Capture the first USERLAND stack frame at wrap time — once per wrap, never

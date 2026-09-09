@@ -1,6 +1,6 @@
 {
 	"name": "@mnemonica/dive",
-	"version": "0.8.7",
+	"version": "0.9.0",
 	"description": "Object-bound context propagation and execution-flow tracing — no ALS, no async_hooks",
 	"type": "module",
 	"main": "./build/index.js",
@@ -8,23 +8,25 @@
 	"exports": {
 		".": {
 			"types": "./build/index.d.ts",
+			"require": "./build-cjs/index.js",
 			"default": "./build/index.js"
 		}
 	},
 	"files": [
 		"build/",
+		"build-cjs/",
 		"README.md",
 		"LICENSE"
 	],
 	"scripts": {
 		"prepare": "husky",
-		"build": "tsc",
+		"build": "tsc && tsc -p tsconfig.cjs.json && node scripts/write-cjs-marker.js",
 		"build:watch": "tsc --watch",
-		"pretest": "tsc",
+		"pretest": "npm run build",
 		"test": "NODE_OPTIONS=--expose-gc vitest run",
 		"test:cov": "NODE_OPTIONS=--expose-gc vitest run --coverage",
 		"test:watch": "vitest",
-		"prepublishOnly": "tsc"
+		"prepublishOnly": "npm run build"
 	},
 	"publishConfig": {
 		"access": "public"

@@ -16,11 +16,13 @@ changing behavior; entries there are settled, not suggestions.
 ## Build & test
 
 ```bash
-npm run build   # tsc → build/
-npm test        # tsc (pretest) && vitest run — always a FRESH build
+npm run build   # tsc → build/ (ESM) + build-cjs/ (CJS, with package.json marker)
+npm test        # npm run build (pretest) && vitest run — always a FRESH build
 ```
 
-`build/` is gitignored; nothing here is committed from it.
+`build/` and `build-cjs/` are gitignored; nothing here is committed from them.
+The CJS flavor exists for `require()` consumers (jest ≤29): the exports map
+routes `require` to `build-cjs/index.js`, ESM stays the default condition.
 
 ## Testing rules (learned the hard way)
 

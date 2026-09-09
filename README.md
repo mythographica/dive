@@ -147,6 +147,11 @@ Dive has no dependency on mnemonica at all — not even a peer one. The two
 meet inside `@mnemonica/otel` (framework-free) or `@mnemonica/nestjs` (the
 NestJS adapter), which depend on both.
 
+**CommonJS consumers** (e.g. jest ≤29 test runs): the package dual-builds —
+`require('@mnemonica/dive')` resolves to `build-cjs/` automatically via the
+exports map, no mocks or `transformIgnorePatterns` needed. ESM stays the
+default for everything else.
+
 ---
 
 ## Quick Start
@@ -203,6 +208,61 @@ framework-free — and the NestJS adapter re-exports it:
 import { attachHooks } from '@mnemonica/otel';
 attachHooks(collection); // preCreation + postCreation + creationError
 ```
+
+This is the whole wiring, verbatim from `src/hooks/attach-hooks.ts` in
+`@mnemonica/otel` — three mnemonica lifecycle hooks driving dive's
+primitives:
+
+```typescript
+collection.registerHook('preCreation', (hookData) => {
+	const parent = hookData.existentInstance;
+	if (parent) {
+		enterContext(parent);
+	}
+	const args = hookData.args;
+	if (Array.isArray(args)) {
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			if (typeof arg === 'function' && !isWrappedFunction(arg)) {
+				args[i] = wrapConstructorArg(arg as (...a: unknown[]) => unknown, parent);
+			}
+		}
+	}
+});
+
+collection.registerHook('postCreation', (hookData) => {
+	const instance = hookData.inheritedInstance;
+	if (!instance) {
+		return;
+	}
+	if (Array.isArray(hookData.args)) {
+		for (const arg of hookData.args) {
+			upgradeConstructorArg(arg, instance);
+		}
+	}
+	recordCreation(hookData.TypeName || 'anonymous', instance, hookData.existentInstance);
+	wrapInstanceMethods(instance);
+});
+
+collection.registerHook('creationError', (hookData) => {
+	recordCreationError(
+		hookData.TypeName || 'anonymous',
+		hookData.inheritedInstance,
+		hookData.existentInstance
+	);
+});
+```
+
+What each hook buys you (from the source's own doc-comment):
+
+- **preCreation** → enter the parent (`existentInstance`) context BEFORE the
+  constructor runs, and wrap any function arguments so callbacks handed to
+  the constructor carry that context.
+- **postCreation** → record the instance's `'create'` edge via
+  `recordCreation`, then wrap the instance's methods.
+- **creationError** → record a failed `'create'` edge (`status: 'error'`)
+  under the surviving parent and pin the error to it: the failure is
+  recoverable off the error object itself.
 
 Dive exports the primitives that wiring is built from, for custom
 integrations (other frameworks, non-Nest mnemonica apps, your own lifecycle

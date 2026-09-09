@@ -6,6 +6,7 @@ coverage
 .idea
 .npmrc
 build/
+build-cjs/
 
 # internal agent memory — never published
 plans/

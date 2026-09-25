@@ -3,10 +3,10 @@
  *
  * The Goal: uncaughtException / unhandledRejection never know where they came
  * from or WHICH DATA caused them. Dive answers it: context is pinned to
- * userland instances (Data), and every wrapped invocation appends an edge to a
- * bounded trace (Flow). When the Data Flow fails, the error is pinned to its
- * deepest trace edge — so the error carries both the data and the flow that
- * happened to it. No AsyncLocalStorage, no async_hooks.
+ * userland instances (Data), and every wrapped invocation records an edge in
+ * the object-linked flow graph (Flow). When the Data Flow fails, the error is
+ * pinned to its deepest flow edge — so the error carries both the data and
+ * the flow that happened to it. No AsyncLocalStorage, no async_hooks.
  *
  * Dive is framework- and library-agnostic: it imports nothing at all.
  * The mnemonica hook wiring (attachHooks) lives in @mnemonica/nestjs — dive
@@ -18,12 +18,10 @@
  *   dive.wrap(fn, context, label) → both
  *   dive.current()                → the instance executing right now
  *   dive.getFlow(target?)         → execution branch: Error | instance | current cursor
- *   dive.getTrace()               → the whole retained trace (copies), oldest first
  *   dive.getRunningEdges()        → the unfinished fibers right now (copies) — crash-time suspects
  *   dive.getErrorInstance(error)  → the data pinned to an error
- *   dive.setTraceLimit(n)         → ring-buffer size for the trace (0 disables recording)
- *   dive.setWeakInstanceRefs(b)   → edge.instance as WeakRef (default) or strong ref opt-out
- *   dive.getCollectedInstanceCount() → how many instances GC reported in weak mode
+ *   dive.stats.{running, recorded, alive, collectedEdges, collectedInstances} → getter fields
+ *   dive.chainDepth(target?)      → getFlow(target).length without copying
  *   dive.registerHook(event, cb)  → subscribe to edge lifecycle: enter | leave | settle | recontext | create
  *   dive.unregisterHook(ev, cb)   → detach an exact subscriber by reference
  *   dive.clear()                  → reset everything (testing)
@@ -37,17 +35,23 @@
  *   dive.recordCreationError(n, e, p?) → failed 'create' edge + error pinning
  *   dive.isWrappedFunction(fn)         → is this function already dive-wrapped?
  *
- * Internals:
- *   - edges: Map<id, FlowEdge> ring buffer (oldest evicted past traceLimit)
- *   - cursor: id of the edge executing right now; null at rest
+ * Internals (flow is linked by OBJECTS — see AGENTS.md "Internals";
+ * the GC decides how long history lives):
+ *   - parents: WeakMap<edge, edge> — successor → predecessor: a live edge
+ *     keeps its ancestors; nothing keeps siblings
+ *   - cursor: the edge executing right now. Between invocations it still
+ *     holds the last executed edge, which keeps that request's chain alive —
+ *     the fixed rest residue (see stats.alive)
  *   - activeDepth: how deep we are inside wrapped invocations; depth > 0 means
  *     the cursor is a truthful execution parent, depth === 0 means we entered
  *     from an unwrapped boundary (timer, emitter, route handler) and parentage
- *     must come from the DATA (latestEdge of the context instance)
- *   - latestEdge: WeakMap<instance, edgeId> — each instance's most recent edge,
+ *     must come from the DATA (latestEdges of the context instance)
+ *   - latestEdges: WeakMap<instance, edge> — each instance's most recent edge,
  *     so construction and method calls continue the instance's own story
  *   - lastContext: the "newest-wins" switcher behind current(); deliberately
- *     NOT used for trace parentage, so concurrent flows cannot corrupt the trace
+ *     NOT used for flow parentage, so concurrent flows cannot corrupt the
+ *     graph. Between constructions it still holds the last constructed
+ *     instance — the same fixed rest residue as the cursor
  */
 
 const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');
@@ -109,11 +113,37 @@ export interface FlowEdge {
 	callsite?       : string;
 	/** explicit vs ambient attribution — see InstanceSource */
 	instanceSource? : InstanceSource;
-	/** weak-refs mode only: set true by the FinalizationRegistry when the
-	 *  instance was collected — edge.instance derefs to undefined from then
-	 *  on. The edge's skeleton (ids, name, status) survives; the payload is
-	 *  gone. Never present in strong mode. */
+	/** true once the edge's instance was collected — edge.instance derefs
+	 *  to undefined from then on; false while it lives and for edges
+	 *  recorded without one. Derived from the same WeakRef, no lag. */
 	instanceCollected? : boolean;
+	/**
+	 * Explicit trace eviction — walk from THIS edge up to the root
+	 * (E, parents.get(E), …):
+	 *
+	 *   drop()         — wipe the whole trace: every edge on the walk loses
+	 *                    its parent link, its object anchor (latestEdges),
+	 *                    and its instance ref; running edges leave the
+	 *                    running store; the cursor is released when it
+	 *                    points into the trace. After it getFlow(E) is just
+	 *                    [E], nothing roots the rest, and it collects as
+	 *                    soon as nothing outside holds it. Price, stated
+	 *                    plainly: an Error pinned to any edge of this trace
+	 *                    keeps ONLY its own edge — getFlow(error) no longer
+	 *                    reaches the story.
+	 *   drop(o1, o2,…) — targeted: the same walk, but only removes the given
+	 *                    objects — where an edge's instance is oN, that
+	 *                    edge's instance ref is cleared; where
+	 *                    latestEdges.get(oN) is the edge, that anchor is
+	 *                    deleted. Edges, parent links, other objects,
+	 *                    siblings, successors all stay. If oN is not what
+	 *                    anchors the trace, memory stays held — by design.
+	 *
+	 * Copies returned by getFlow()/getRunningEdges() resolve to their live
+	 * edge (a weak side-link — copies never pin the trace). No return
+	 * value; non-object args are ignored; calling twice is a no-op.
+	 */
+	drop: (...targets: unknown[]) => void;
 }
 
 // A constructor arg wrapped at preCreation carries a MUTABLE context holder so
@@ -148,8 +178,8 @@ interface DiveArgHolder { context: object | undefined; used: boolean; }
  *               channel) follow constructions without touching the adapter
  *               contract. error is set on the recordCreationError path.
  *
- * Hooks fire only when an edge is recorded: with traceLimit 0 there is nothing
- * to observe and no event fires. Dispatch cost when unsubscribed is one length
+ * Hooks fire with every recorded edge (recording has no off switch).
+ * Dispatch cost when unsubscribed is one length
  * check per edge; subscriber exceptions are contained per-subscriber — a
  * throwing hook degrades its own observability, never the trace.
  */
@@ -305,62 +335,204 @@ function emitCreate (edge: FlowEdge, error: unknown): void {
 }
 
 
-let edges = new Map<number, FlowEdge>();
-let latestEdge = new WeakMap<object, number>();
+// Flow links are OBJECTS (AGENTS.md "Internals"): the GC can
+// see them, so whatever is alive keeps its own chain.
+//   latestEdges: object → its latest edge (lives as long as the object;
+//                the continuation point for later edges on the same data)
+//   parents:     successor edge → predecessor edge (a live edge keeps its
+//                ancestors; nothing keeps siblings)
+// Edge ids and parentId stay on edges as LABELS only.
+let latestEdges = new WeakMap<object, Edge>();
+let parents = new WeakMap<Edge, Edge>();
 let nextEdgeId = 1;
-// The running-edges store (2026-09-02, reports/running-edges-store-design.md):
-// the SAME edge objects the ring holds, added at recordEdge, deleted at
-// settle — the unfinished fibers, i.e. the suspect set for uncaughtException
-// attribution, queryable in O(1) without scanning the ring. Skeletons only:
-// the payload stays behind the edge's WeakRef getter, so this set never pins
-// user data. In bounded-ring configs it doubles as the eviction-immune
-// secondary storage for unfinished fibers. Invalidation is lifecycle-driven
+// The running-edges store (design note: reports/running-edges-store-design.md):
+// the edge objects added at recordEdge and deleted at settle — the unfinished
+// fibers, i.e. the suspect set for uncaughtException attribution, queryable
+// in O(1) without walking parents. This is the
+// ONLY strong root dive owns: a running edge = incomplete flow = never
+// collectable. Skeletons only: the payload stays behind the edge's WeakRef
+// getter, so this set never pins user data. Invalidation is lifecycle-driven
 // (settle), never consumer-driven — an unconsumed store leaks nothing.
 const runningEdges = new Set<FlowEdge>();
-// Default unbounded since 2026-09-02 (Viktor's fiber model): retention is
-// meant to be GC-driven (weak mode), not eviction-driven. setTraceLimit
-// restores a bound — 1024 was the pre-flip default. Ring size and ref
-// strength are INDEPENDENT knobs; the dangerous pair is strong refs +
-// unbounded ring, which pins every instance — measured +6.7KB/request,
-// zero release (reports/lastcontext-ambiguity.md).
-let traceLimit = Number.MAX_SAFE_INTEGER;
-let cursor: number | null = null;
+// Copy → the LIVE edge it was copied from, held weakly: copies returned by
+// getFlow()/getRunningEdges() resolve back to their live edge for edge.drop()
+// and flow walks — without copies pinning the trace (a strong link here
+// would keep every copied branch alive for as long as any copy is stored).
+const copySource = new WeakMap<Edge, WeakRef<Edge>>();
+let cursor: Edge | null = null;
 let activeDepth = 0;
 let lastContext: object | undefined;
 
 /**
- * Weak instance mode (2026-09-02, Viktor's fiber model) — DEFAULT since
- * 2026-09-02: edge.instance is stored as a WeakRef behind a getter, so a
- * finished fiber's payload is GC-releasable while the ring keeps the
- * story's skeleton (ids, names, statuses) in the ordered Map — a WeakMap
- * ring is not constructible (object keys only, non-enumerable).
- * setWeakInstanceRefs(false) restores strong refs (the ring pins
- * instances; nothing it retains is GC-releasable).
- * The FinalizationRegistry is the notification half: when an instance is
- * collected, every edge that referenced it gets instanceCollected = true.
- * Cells are per-instance and live in a WeakMap (no pinning); each cell
- * captures the edges Map of its era so stale callbacks after clear() mark
- * a dead map, never the live one.
+ * Edges never pin their instance (weak refs are the only mode — AGENTS.md
+ * "settled facts"): edge.instance is a
+ * WeakRef deref, so a finished fiber's payload is GC-releasable.
+ * instanceCollected is derived from that same WeakRef (Edge below).
+ * ONE WeakRef per instance, shared by all its edges (a Session behind
+ * every key press does not get one WeakRef per edge): a new edge takes it
+ * from the instance's latest edge (latestEdges, below).
+ * The registries only COUNT collections (dive.stats): instances once per
+ * instance (first sight: no latest edge yet), edges once per edge. Every
+ * registration carries the ERA token current at recording time; clear()
+ * starts a new era, so callbacks for pre-clear objects — which keep
+ * arriving after it — never touch the new era's counters.
  */
-type instanceCell = {
-	map     : Map<number, FlowEdge>;
-	edgeIds : number[];
-};
-let weakInstanceRefs = true;
+let era: object = {};
+let recordedEdgeCount = 0;
+let collectedEdgeCount = 0;
 let collectedInstanceCount = 0;
-let instanceCells = new WeakMap<object, instanceCell>();
-const instanceRegistry = new FinalizationRegistry((cell: instanceCell) => {
-	collectedInstanceCount++;
-	for (const id of cell.edgeIds) {
-		const edge = cell.map.get(id);
-		if (edge) {
-			edge.instanceCollected = true;
-		}
+const instanceRegistry = new FinalizationRegistry((recordedIn: object) => {
+	if (recordedIn === era) {
+		collectedInstanceCount++;
+	}
+});
+const edgeRegistry = new FinalizationRegistry((recordedIn: object) => {
+	if (recordedIn === era) {
+		collectedEdgeCount++;
 	}
 });
 
 function isObjectKey (value: unknown): value is object {
 	return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+
+/**
+ * The edge object. Every field is declared in the constructor, so all
+ * edges share one V8 hidden class (fast properties); `instance` is ONE
+ * prototype getter over the private WeakRef — no per-edge closure.
+ * A per-edge Object.defineProperty getter plus late instanceCollected
+ * lands in V8 dictionary mode: a 448-byte property table
+ * per edge (measured in /code/experiments/2026-09-24-otel-soak-unbounded/) —
+ * the declaration-order layout above is what keeps an edge at ~120 B.
+ */
+class Edge implements FlowEdge {
+	id             : number;
+	parentId       : number | null;
+	name           : string;
+	kind           : FlowKind;
+	ts             : number;
+	duration       : number | undefined;
+	status         : FlowStatus;
+	label          : string | undefined;
+	callsite       : string | undefined;
+	instanceSource : InstanceSource | undefined;
+	#ref           : WeakRef<object> | undefined;
+
+	constructor (id: number, parentId: number | null, name: string, kind: FlowKind, ref: WeakRef<object> | undefined) {
+		this.id = id;
+		this.parentId = parentId;
+		this.name = name;
+		this.kind = kind;
+		this.ts = Date.now();
+		this.duration = undefined;
+		this.status = STATUS_RUNNING;
+		this.label = undefined;
+		this.callsite = undefined;
+		this.instanceSource = undefined;
+		this.#ref = ref;
+	}
+
+	get instance (): object | undefined {
+		const result = this.#ref === undefined ? undefined : this.#ref.deref();
+		return result;
+	}
+
+	/** true once the edge's instance was collected; false while it lives
+	 *  and for edges recorded without one */
+	get instanceCollected (): boolean {
+		const result = this.#ref !== undefined && this.#ref.deref() === undefined;
+		return result;
+	}
+
+	/** the instance's shared WeakRef — module-internal (the class is not
+	 *  exported), so the next edge on the same instance can reuse it */
+	static refOf (edge: Edge): WeakRef<object> | undefined {
+		const result = edge.#ref;
+		return result;
+	}
+
+	/**
+	 * A snapshot for the public accessors: data fields copied, the SAME
+	 * WeakRef shared — reading the copy never pins the instance, and its
+	 * collection is visible through the copy. A weak side-link points the
+	 * copy at its live original (chained to the first non-copy source, so
+	 * a copy of a copy still resolves) — see copySource above.
+	 */
+	copy (): Edge {
+		const result = new Edge(this.id, this.parentId, this.name, this.kind, this.#ref);
+		result.ts = this.ts;
+		result.duration = this.duration;
+		result.status = this.status;
+		result.label = this.label;
+		result.callsite = this.callsite;
+		result.instanceSource = this.instanceSource;
+		const source = copySource.get(this);
+		copySource.set(result, source ?? new WeakRef(this));
+		return result;
+	}
+
+	/**
+	 * Explicit trace eviction — walk from THIS edge up to the root
+	 * (this, parents.get(this), …). See the FlowEdge.drop doc for the
+	 * contract; this is the implementation the copies resolve into.
+	 */
+	drop (...targets: unknown[]): void {
+		// copies resolve to their live edge; a dead original is a no-op
+		const source = copySource.get(this);
+		const start = source ? source.deref() : this;
+		if (start === undefined) {
+			return;
+		}
+		if (targets.length === 0) {
+			Edge.wipeTrace(start);
+			return;
+		}
+		const wanted = new Set<object>(targets.filter(isObjectKey));
+		if (wanted.size === 0) {
+			return; // only non-object args — ignored, and NOT a wipe
+		}
+		let edge: Edge | undefined = start;
+		while (edge) {
+			const parent = parents.get(edge);
+			const inst = edge.#ref === undefined ? undefined : edge.#ref.deref();
+			// remove the edge's instance ref when it belongs to a wanted object
+			if (inst !== undefined && wanted.has(inst)) {
+				edge.#ref = undefined;
+			}
+			// remove the anchor only when THIS edge is what anchors a wanted object
+			for (const t of wanted) {
+				if (latestEdges.get(t) === edge) {
+					latestEdges.delete(t);
+				}
+			}
+			edge = parent;
+		}
+	}
+	/**
+	 * The full-trace half of drop(): every edge from `start` up to the root
+	 * loses its parent link, its object anchor, and its instance ref;
+	 * running edges leave the running store; the cursor is released when
+	 * it points into the trace. The per-edge #ref field is cleared — never
+	 * the shared WeakRef object — and the fast-properties layout is
+	 * untouched. A private static because only the class may touch #ref.
+	 */
+	private static wipeTrace (start: Edge): void {
+		let edge: Edge | undefined = start;
+		while (edge) {
+			const parent = parents.get(edge);
+			parents.delete(edge);
+			const inst = edge.#ref === undefined ? undefined : edge.#ref.deref();
+			if (inst !== undefined && latestEdges.get(inst) === edge) {
+				latestEdges.delete(inst);
+			}
+			edge.#ref = undefined;
+			runningEdges.delete(edge);
+			if (cursor === edge) {
+				cursor = null;
+			}
+			edge = parent;
+		}
+	}
 }
 
 /**
@@ -374,59 +546,35 @@ function settleRunning (edge: FlowEdge): void {
 }
 
 /**
- * Append an edge to the trace. Evicts the oldest edges past traceLimit.
- * Returns undefined when recording is disabled (traceLimit === 0).
+ * Record an edge — always (recording has no off switch). The edge joins
+ * the object graph: parents (its predecessor), latestEdges (its instance's
+ * continuation point), runningEdges (until it settles). The registries
+ * only COUNT it.
  */
 function recordEdge (
 	kind: FlowKind,
 	name: string,
 	instance: object | undefined,
-	parentId: number | null
-): FlowEdge | undefined {
-	if (traceLimit === 0) {
-		return undefined;
-	}
-	const edge: FlowEdge = {
-		id       : nextEdgeId++,
-		parentId,
-		instance : undefined,
-		name,
-		kind,
-		ts       : Date.now(),
-		duration : undefined,
-		status   : STATUS_RUNNING,
-	};
-	if (weakInstanceRefs && isObjectKey(instance)) {
-		const ref = new WeakRef(instance);
-		let cell = instanceCells.get(instance);
-		if (!cell) {
-			cell = { map: edges, edgeIds: [] };
-			instanceCells.set(instance, cell);
-			instanceRegistry.register(instance, cell);
-		}
-		cell.edgeIds.push(edge.id);
-		Object.defineProperty(edge, 'instance', {
-			enumerable   : true,
-			configurable : true,
-			get () {
-				const result = ref.deref();
-				return result;
-			},
-		});
-	} else {
-		edge.instance = instance;
-	}
-	edges.set(edge.id, edge);
-	runningEdges.add(edge);
-	while (edges.size > traceLimit) {
-		const oldest = edges.keys().next();
-		if (oldest.done) {
-			break;
-		}
-		edges.delete(oldest.value);
-	}
+	parent: Edge | null
+): Edge {
+	let ref: WeakRef<object> | undefined;
 	if (isObjectKey(instance)) {
-		latestEdge.set(instance, edge.id);
+		const latest = latestEdges.get(instance);
+		ref = latest ? Edge.refOf(latest) : undefined;
+		if (ref === undefined) {
+			ref = new WeakRef(instance);
+			instanceRegistry.register(instance, era);
+		}
+	}
+	const edge = new Edge(nextEdgeId++, parent ? parent.id : null, name, kind, ref);
+	if (parent) {
+		parents.set(edge, parent);
+	}
+	recordedEdgeCount++;
+	edgeRegistry.register(edge, era);
+	runningEdges.add(edge);
+	if (isObjectKey(instance)) {
+		latestEdges.set(instance, edge);
 	}
 	return edge;
 }
@@ -442,17 +590,15 @@ function recordEdge (
  * it would merge two requests into one branch. Instead the edge continues the
  * DATA's own story: the latest edge of the context instance. This is what
  * makes cross-request trace clobbering structurally impossible.
+ * The continuation point is an OBJECT held by latestEdges: if it is there,
+ * it is alive — never a dangling id, so no fresh-root fallback is needed.
  */
-function executionParent (context: object | undefined): number | null {
+function executionParent (context: object | undefined): Edge | null {
 	if (activeDepth > 0 && cursor !== null) {
 		return cursor;
 	}
 	if (isObjectKey(context)) {
-		const own = latestEdge.get(context);
-		// The instance's latest edge may have been evicted from the ring
-		// buffer; parenting onto a dangling id would claim a story nobody
-		// retained. A forgotten continuation point is a fresh root.
-		const result = own !== undefined && edges.has(own) ? own : null;
+		const result = latestEdges.get(context) ?? null;
 		return result;
 	}
 	return null;
@@ -463,26 +609,26 @@ function executionParent (context: object | undefined): number | null {
  * through is marked 'error', but the error OBJECT is pinned only ONCE: the
  * first (deepest) wrapped boundary wins, so the flight recorder points at the
  * failure site, not at some outer re-throw.
+ * The pin is the edge OBJECT (not its id): the Error itself keeps its
+ * failing edge alive for as long as the Error lives — an exception filter
+ * reading getFlow(error) later never depends on anything else still
+ * holding the edge.
  */
-function pinError (error: unknown, edge: FlowEdge | undefined, instance: object | undefined): void {
+function pinError (error: unknown, edge: FlowEdge, instance: object | undefined): void {
 	if (!isObjectKey(error)) {
 		return;
 	}
-	if (edge) {
-		edge.status = STATUS_ERROR;
-		settleRunning(edge);
-	}
+	edge.status = STATUS_ERROR;
+	settleRunning(edge);
 	if (SymbolDiveEdge in (error as Record<symbol, unknown>)) {
 		return;
 	}
-	if (edge) {
-		Object.defineProperty(error, SymbolDiveEdge, {
-			value        : edge.id,
-			writable     : false,
-			enumerable   : false,
-			configurable : true,
-		});
-	}
+	Object.defineProperty(error, SymbolDiveEdge, {
+		value        : edge,
+		writable     : false,
+		enumerable   : false,
+		configurable : true,
+	});
 	if (isObjectKey(instance)) {
 		Object.defineProperty(error, SymbolDiveInstance, {
 			value        : instance,
@@ -619,30 +765,24 @@ function computeCaption (
  */
 function tapPromise (
 	result: Promise<unknown>,
-	edge: FlowEdge | undefined,
+	edge: FlowEdge,
 	context: object | undefined,
 	started: number
 ): Promise<unknown> {
 	const promiseResult = result.then((resolved: unknown) => {
-		if (edge) {
-			edge.status = STATUS_OK;
-			settleRunning(edge);
-			edge.duration = Date.now() - started;
-		}
+		edge.status = STATUS_OK;
+		settleRunning(edge);
+		edge.duration = Date.now() - started;
 		let settled: unknown = resolved;
 		if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
 			const wrappedResult = wrapEntry(resolved as (...args: unknown[]) => unknown, context, true);
 			settled = wrappedResult;
 		}
-		if (edge) {
-			emitSettle(edge, settled, undefined);
-		}
+		emitSettle(edge, settled, undefined);
 		return settled;
 	}).catch((error: unknown) => {
 		pinError(error, edge, context);
-		if (edge) {
-			emitSettle(edge, undefined, error);
-		}
+		emitSettle(edge, undefined, error);
 		throw error;
 	});
 	return promiseResult;
@@ -752,20 +892,14 @@ function recordHandoff (
 	context: object | undefined,
 	caption?: string
 ): void {
-	let parentId: number | null = null;
-	if (isObjectKey(previousContext)) {
-		const own = latestEdge.get(previousContext);
-		parentId = own !== undefined && edges.has(own) ? own : null;
-	}
+	const parent = isObjectKey(previousContext) ? latestEdges.get(previousContext) ?? null : null;
 	const name = caption || (fn as { name?: string }).name || ANONYMOUS;
-	const edge = recordEdge(KIND_RECONTEXT, name, context, parentId);
-	if (edge) {
-		// The context arrives as an argument — attribution is never ambient here
-		if (isObjectKey(context)) {
-			edge.instanceSource = 'explicit';
-		}
-		emitRecontext(edge, fn, previousContext, context);
+	const edge = recordEdge(KIND_RECONTEXT, name, context, parent);
+	// The context arrives as an argument — attribution is never ambient here
+	if (isObjectKey(context)) {
+		edge.instanceSource = 'explicit';
 	}
+	emitRecontext(edge, fn, previousContext, context);
 }
 
 /**
@@ -799,22 +933,20 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 			capturedContext,
 			executionParent(capturedContext)
 		);
-		if (edge) {
-			if (label !== undefined) {
-				edge.label = label;
-			}
-			if (callsite !== undefined) {
-				edge.callsite = callsite;
-			}
-			if (capturedContext !== undefined) {
-				edge.instanceSource = capturedSource;
-			}
-			cursor = edge.id;
-			emitEnter(edge, args);
+		if (label !== undefined) {
+			edge.label = label;
 		}
+		if (callsite !== undefined) {
+			edge.callsite = callsite;
+		}
+		if (capturedContext !== undefined) {
+			edge.instanceSource = capturedSource;
+		}
+		cursor = edge;
+		emitEnter(edge, args);
 		activeDepth++;
 
-		const started = edge ? edge.ts : 0;
+		const started = edge.ts;
 		let produced: unknown;
 		try {
 			// Wrap function args with the captured context so context propagates
@@ -848,20 +980,16 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 				return promiseResult;
 			}
 
-			if (edge) {
-				edge.status = STATUS_OK;
-				settleRunning(edge);
-			}
+			edge.status = STATUS_OK;
+			settleRunning(edge);
 			produced = result;
 			return result;
 		} catch (error: unknown) {
 			pinError(error, edge, capturedContext);
 			throw error;
 		} finally {
-			if (edge) {
-				edge.duration = Date.now() - started;
-				emitLeave(edge, produced);
-			}
+			edge.duration = Date.now() - started;
+			emitLeave(edge, produced);
 			cursor = previousCursor;
 			activeDepth--;
 			lastContext = previousContext;
@@ -1041,15 +1169,13 @@ export function wrapInstanceMethods (instance: object): void {
 			lastContext = context;
 
 			const edge = recordEdge(KIND_METHOD, name, context, executionParent(context));
-			if (edge) {
-				// The receiver IS the context — never ambient
-				edge.instanceSource = 'explicit';
-				cursor = edge.id;
-				emitEnter(edge, args);
-			}
+			// The receiver IS the context — never ambient
+			edge.instanceSource = 'explicit';
+			cursor = edge;
+			emitEnter(edge, args);
 			activeDepth++;
 
-			const started = edge ? edge.ts : 0;
+			const started = edge.ts;
 			let produced: unknown;
 			try {
 				const wrappedArgs = wrapArgs(args, context);
@@ -1065,20 +1191,16 @@ export function wrapInstanceMethods (instance: object): void {
 					return promiseResult;
 				}
 
-				if (edge) {
-					edge.status = STATUS_OK;
-					settleRunning(edge);
-				}
+				edge.status = STATUS_OK;
+				settleRunning(edge);
 				produced = result;
 				return result;
 			} catch (error: unknown) {
 				pinError(error, edge, context);
 				throw error;
 			} finally {
-				if (edge) {
-					edge.duration = Date.now() - started;
-					emitLeave(edge, produced);
-				}
+				edge.duration = Date.now() - started;
+				emitLeave(edge, produced);
 				cursor = previousCursor;
 				activeDepth--;
 				lastContext = previousContext;
@@ -1111,30 +1233,32 @@ export function wrapInstanceMethods (instance: object): void {
  * execution cursor only when truly nested. Also switches current() to the
  * built instance.
  */
-export function recordCreation (name: string, instance: object, parent?: object): void {
-	let parentId: number | null = null;
+// A construction's parent: the parent instance's latest edge (data flow),
+// else — only when truly nested — the execution cursor.
+function creationParent (parent: object | undefined): Edge | null {
 	if (isObjectKey(parent)) {
-		const own = latestEdge.get(parent);
-		parentId = own !== undefined && edges.has(own) ? own : null;
-	} else if (activeDepth > 0 && cursor !== null) {
-		parentId = cursor;
+		const result = latestEdges.get(parent) ?? null;
+		return result;
 	}
-	const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, instance, parentId);
-	if (edge) {
-		// recordCreation fires at postCreation: the construction HAS completed.
-		// 'running' means genuinely unsettled — a finished construction must not
-		// wear it. Duration is unmeasured at this level (the hook moment IS the
-		// completion), so 0, mirroring recordCreationError.
-		edge.status = STATUS_OK;
-		settleRunning(edge);
-		edge.duration = 0;
-		// The constructed instance arrives as an argument — never ambient
-		edge.instanceSource = 'explicit';
-		// Opt-in 'create', NOT 'enter': the adapter owns this lifecycle via
-		// mnemonica's hooks; enter would double-report there (see the event's
-		// doc above).
-		emitCreate(edge, undefined);
-	}
+	const result = activeDepth > 0 ? cursor : null;
+	return result;
+}
+
+export function recordCreation (name: string, instance: object, parent?: object): void {
+	const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, instance, creationParent(parent));
+	// recordCreation fires at postCreation: the construction HAS completed.
+	// 'running' means genuinely unsettled — a finished construction must not
+	// wear it. Duration is unmeasured at this level (the hook moment IS the
+	// completion), so 0, mirroring recordCreationError.
+	edge.status = STATUS_OK;
+	settleRunning(edge);
+	edge.duration = 0;
+	// The constructed instance arrives as an argument — never ambient
+	edge.instanceSource = 'explicit';
+	// Opt-in 'create', NOT 'enter': the adapter owns this lifecycle via
+	// mnemonica's hooks; enter would double-report there (see the event's
+	// doc above).
+	emitCreate(edge, undefined);
 	enterContext(instance);
 }
 
@@ -1148,27 +1272,16 @@ export function recordCreationError (name: string, errored: unknown, parent?: ob
 	if (errored instanceof Error) {
 		// Record the FAILED creation as an edge in the parent's branch, then
 		// pin the error to it — the flight recorder for "the data flow failed".
-		let parentId: number | null = null;
+		const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, parent, creationParent(parent));
+		edge.duration = 0;
+		// The surviving parent arrives as an argument — never ambient
 		if (isObjectKey(parent)) {
-			const own = latestEdge.get(parent);
-			parentId = own !== undefined && edges.has(own) ? own : null;
-		} else if (activeDepth > 0 && cursor !== null) {
-			parentId = cursor;
-		}
-		const edge = recordEdge(KIND_CREATE, name || ANONYMOUS, parent, parentId);
-		if (edge) {
-			edge.duration = 0;
-			// The surviving parent arrives as an argument — never ambient
-			if (isObjectKey(parent)) {
-				edge.instanceSource = 'explicit';
-			}
+			edge.instanceSource = 'explicit';
 		}
 		pinError(errored, edge, parent);
-		if (edge) {
-			// Emitted after pinError so subscribers see the failure already
-			// pinned; same opt-in 'create' event as recordCreation.
-			emitCreate(edge, errored);
-		}
+		// Emitted after pinError so subscribers see the failure already
+		// pinned; same opt-in 'create' event as recordCreation.
+		emitCreate(edge, errored);
 	}
 	if (errored) {
 		enterContext(errored as object);
@@ -1188,73 +1301,85 @@ export function current (): object | undefined {
 }
 
 /**
- * Reconstruct an execution branch from the trace, oldest edge first.
+ * Reconstruct an execution branch from the flow graph, oldest edge first.
  *
  *   getFlow()          → branch of the current cursor (empty at rest)
  *   getFlow(error)     → flight recorder: the branch that produced the error
  *   getFlow(instance)  → the branch of that instance's latest edge
  *
- * Returns copies of the stored edges. If the branch head was evicted from the
- * ring buffer, the result starts at the oldest edge still retained.
+ * Returns copies of the live edge objects. The walk follows parents (object links),
+ * so a branch reaches back exactly as far as something alive kept it — a
+ * held Error, a pending timer, the context instance itself.
  */
 export function getFlow (target?: unknown): FlowEdge[] {
-	let edgeId: number | undefined;
-	if (target === undefined) {
-		edgeId = cursor !== null ? cursor : undefined;
-	} else if (target instanceof Error) {
-		edgeId = (target as unknown as Record<symbol, unknown>)[SymbolDiveEdge] as number | undefined;
-	} else if (isObjectKey(target)) {
-		edgeId = latestEdge.get(target);
-	}
-
 	const branch: FlowEdge[] = [];
-	let edge = edgeId !== undefined ? edges.get(edgeId) : undefined;
+	let edge = flowStart(target);
 	while (edge) {
 		branch.unshift(copyEdge(edge));
-		edge = edge.parentId !== null ? edges.get(edge.parentId) : undefined;
+		edge = parents.get(edge);
 	}
 	return branch;
 }
 
 /**
- * The whole retained trace — copies of every edge still in the ring buffer,
- * oldest first. Unlike getFlow() this needs no target: it is the inspection
- * surface for tooling (remote debugging, visualization) that asks "what
- * flowed through this process?" when no cursor is live.
- *
- * Same copy semantics as getFlow(): mutating the result never touches the
- * trace. Edges carry their instance REFERENCE — callers crossing a process
- * boundary (CDP, WS, HTTP) must map to a JSON-safe shape themselves.
+ * getFlow(target).length without copying a single edge — for tests and
+ * benchmarks asserting how long a chain something keeps alive.
  */
-/**
- * Copy an edge for the public accessors. In weak mode the instance lives
- * behind a getter — a naive spread would READ it at copy time and pin the
- * instance on the copy, defeating the whole mode (and it did: the first
- * weak-refs test run failed exactly this way). Preserve the getter.
- */
-function copyEdge (edge: FlowEdge): FlowEdge {
-	const copy = { ...edge };
-	const descriptor = Object.getOwnPropertyDescriptor(edge, 'instance');
-	if (descriptor && descriptor.get) {
-		Object.defineProperty(copy, 'instance', {
-			enumerable   : true,
-			configurable : true,
-			get          : descriptor.get,
-		});
+export function chainDepth (target?: unknown): number {
+	let depth = 0;
+	let edge = flowStart(target);
+	while (edge) {
+		depth++;
+		edge = parents.get(edge);
 	}
-	const result = copy;
+	return depth;
+}
+
+// The edge a flow walk starts from: an edge (a copy resolves to its live
+// original — see copySource), the edge pinned to an Error, the current
+// cursor, or an object's latest edge.
+function flowStart (target: unknown): Edge | undefined {
+	if (target instanceof Edge) {
+		const source = copySource.get(target);
+		const result = source ? source.deref() : target;
+		return result === undefined ? undefined : result;
+	}
+	if (target instanceof Error) {
+		const pinned = pinnedEdge(target);
+		return pinned;
+	}
+	let result: Edge | undefined;
+	if (target === undefined) {
+		result = cursor ?? undefined;
+	} else if (isObjectKey(target)) {
+		result = latestEdges.get(target);
+	}
 	return result;
 }
 
-export function getTrace (): FlowEdge[] {
-	const result = [...edges.values()].map((edge) => copyEdge(edge));
+// The edge object pinError put on an error (undefined when none).
+function pinnedEdge (error: object): Edge | undefined {
+	const pinned = (error as Record<symbol, unknown>)[SymbolDiveEdge];
+	const result = pinned instanceof Edge ? pinned : undefined;
+	return result;
+}
+
+/**
+ * Copy an edge for the public accessors. The instance lives behind the
+ * WeakRef getter — a naive spread would READ it at copy time and pin the
+ * instance on the copy (the first weak-refs test run failed exactly this
+ * way). Edge.copy() shares the WeakRef instead. Every recorded edge is an
+ * Edge; the spread branch only narrows the declared FlowEdge type.
+ */
+function copyEdge (edge: FlowEdge): FlowEdge {
+	const result = edge instanceof Edge ? edge.copy() : { ...edge };
 	return result;
 }
 
 /**
  * The edges still running right now — the unfinished fibers, i.e. the
  * suspect set for uncaughtException/unhandledRejection attribution,
- * without scanning the ring. Copies, same semantics as getTrace.
+ * without walking parents. Copies, same semantics as getFlow.
  * See reports/running-edges-store-design.md.
  */
 export function getRunningEdges (): FlowEdge[] {
@@ -1274,73 +1399,61 @@ export function getErrorInstance (error: Error): object | undefined {
 	if (pinned !== undefined) {
 		return pinned;
 	}
-	const edgeId = (error as unknown as Record<symbol, unknown>)[SymbolDiveEdge] as number | undefined;
-	if (edgeId === undefined) {
-		return undefined;
-	}
-	const edge = edges.get(edgeId);
+	const edge = pinnedEdge(error);
 	const result = edge ? edge.instance : undefined;
 	return result;
 }
 
 /**
- * Set the ring-buffer size of the trace. 0 disables recording (context
- * switching still works; getFlow returns empty branches). Shrinking evicts
- * the oldest edges immediately.
+ * dive's control surface — getter FIELDS, read-only, per era (clear()
+ * resets them). For tests, benchmarks and live probes.
+ *   running            — edges running right now (the running store)
+ *   recorded           — edges recorded
+ *   collectedEdges     — edges the GC has collected (reported by a
+ *                        FinalizationRegistry: lags a GC by one task)
+ *   alive              — recorded − collectedEdges
+ *   collectedInstances — instances the GC has collected
  */
-export function setTraceLimit (limit: number): void {
-	if (!Number.isInteger(limit) || limit < 0) {
-		throw new Error('setTraceLimit expects a non-negative integer');
-	}
-	traceLimit = limit;
-	while (edges.size > traceLimit) {
-		const oldest = edges.keys().next();
-		if (oldest.done) {
-			break;
-		}
-		edges.delete(oldest.value);
-	}
-}
+export const stats = Object.freeze({
+	get running (): number {
+		const result = runningEdges.size;
+		return result;
+	},
+	get recorded (): number {
+		const result = recordedEdgeCount;
+		return result;
+	},
+	get collectedEdges (): number {
+		const result = collectedEdgeCount;
+		return result;
+	},
+	get alive (): number {
+		const result = recordedEdgeCount - collectedEdgeCount;
+		return result;
+	},
+	get collectedInstances (): number {
+		const result = collectedInstanceCount;
+		return result;
+	},
+});
 
 /**
- * Switch edge.instance storage between a WeakRef behind a getter +
- * FinalizationRegistry notification (default since 2026-09-02 — a
- * finished fiber releases its payload; the edge keeps its skeleton and is
- * marked instanceCollected = true when the collection is reported) and a
- * strong reference (the ring pins instances; nothing it retains is
- * GC-releasable).
- * Viktor's fiber model, 2026-09-02.
- */
-export function setWeakInstanceRefs (enable: boolean): void {
-	weakInstanceRefs = enable === true;
-}
-
-/**
- * How many instances the FinalizationRegistry has reported collected in
- * weak mode — the observability half of the fiber model.
- */
-export function getCollectedInstanceCount (): number {
-	const result = collectedInstanceCount;
-	return result;
-}
-
-/**
- * Reset everything: trace, cursor, depth, context, trace limit, and the
- * registered lifecycle hooks. Useful for testing — note that adapter-level
- * subscribers must re-register after a clear().
+ * Reset everything: object links, the running store, cursor, depth, context,
+ * counters, and the registered lifecycle hooks. Useful for testing — note
+ * that adapter-level subscribers must re-register after a clear().
  */
 export function clear (): void {
-	edges = new Map<number, FlowEdge>();
-	latestEdge = new WeakMap<object, number>();
+	latestEdges = new WeakMap<object, Edge>();
+	parents = new WeakMap<Edge, Edge>();
 	nextEdgeId = 1;
-	traceLimit = Number.MAX_SAFE_INTEGER;
 	runningEdges.clear();
 	cursor = null;
 	activeDepth = 0;
 	lastContext = undefined;
-	weakInstanceRefs = true;
+	era = {};
+	recordedEdgeCount = 0;
+	collectedEdgeCount = 0;
 	collectedInstanceCount = 0;
-	instanceCells = new WeakMap<object, instanceCell>();
 	hooks.enter.length = 0;
 	hooks.leave.length = 0;
 	hooks.settle.length = 0;

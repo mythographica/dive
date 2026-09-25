@@ -1,7 +1,7 @@
 /**
  * Tests for re-wrap shadowing and the 'recontext' handoff edge.
  *
- * The semantics under test (see DECISIONS.md):
+ * The semantics under test (AGENTS.md "settled facts"):
  *
  *   - wrap of a wrapper with no/same context is idempotent (returned as-is)
  *   - wrap of a wrapper with a DIFFERENT context shadows: a fresh wrapper
@@ -12,8 +12,8 @@
  *   - auto-wrap crossings (function args) never shadow: a callback keeps
  *     its story when passed through another flow
  *   - constructor-arg holders have no origin info and never shadow
- *   - an instance's evicted latest edge parents nothing: forgotten
- *     continuation points become fresh roots (no dangling parentId)
+ *   - an instance's continuation point is an object link: a live instance
+ *     always continues its own story (no dangling parentId)
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 
@@ -22,14 +22,12 @@ import {
 	wrapConstructorArg,
 	getFlow,
 	isWrappedFunction,
-	setTraceLimit,
 	clear,
 } from '../src/index.js';
 
 describe('re-wrap policy', () => {
 	beforeEach(() => {
 		clear();
-		setTraceLimit(1024);
 	});
 
 	it('wrap of a wrapper with no context is idempotent', () => {
@@ -146,19 +144,19 @@ describe('re-wrap policy', () => {
 	});
 });
 
-describe('trace honesty: evicted continuation points', () => {
+describe('trace honesty: continuation points are objects', () => {
 	beforeEach(() => {
 		clear();
-		setTraceLimit(1024);
 	});
 
-	it('an instance whose latest edge was evicted starts a fresh root instead of a dangling parent', () => {
+	// continuation points are
+	// OBJECTS held by latestEdges — a live object's latest edge is alive by
+	// definition; nothing can cut a story from under a live object
+	it('a live instance continues from its latest edge across interleaved flows', () => {
 		const ctxA = { id: 'a' };
 		const ctxB = { id: 'b' };
 		const fnA = () => 'a';
 		const fnB = () => 'b';
-
-		setTraceLimit(3);
 
 		const wA = wrap(fnA, ctxA);
 		const wB = wrap(fnB, ctxB);
@@ -166,12 +164,14 @@ describe('trace honesty: evicted continuation points', () => {
 		wA(); // e1 — ctxA's only edge
 		wB(); // e2
 		wB(); // e3
-		wB(); // e4 — buffer {e2, e3, e4}, e1 evicted; ctxA's latestEdge is stale
+		wB(); // e4 — ctxB's story interleaves; ctxA's continuation stays e1
 
-		wA(); // e5 — must NOT claim the evicted e1 as parent
+		wA(); // e5 — continues from e1: ctxA is alive, so is its latest edge
 
 		const flowA = getFlow(ctxA);
-		expect(flowA.length).toBe(1);
+		expect(flowA.length).toBe(2);
+		expect(flowA[0].id).toBe(1);
 		expect(flowA[0].parentId).toBeNull();
+		expect(flowA[1].parentId).toBe(1);
 	});
 });

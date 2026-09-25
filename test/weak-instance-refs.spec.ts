@@ -1,18 +1,15 @@
 /**
- * Weak instance refs (Viktor's fiber model, 2026-09-02 —
+ * Weak instance refs (Viktor's fiber model — evidence in
  * reports/lastcontext-ambiguity.md).
  *
  * The semantics under test:
  *
- *   - DEFAULT (since 2026-09-02) is WEAK mode: edge.instance is a
- *     WeakRef deref; once nothing else holds the instance, GC collects
- *     it, the getter returns undefined, and the FinalizationRegistry
- *     marks the edge instanceCollected
- *   - setWeakInstanceRefs(false) is the strong opt-out: the ring pins
- *     instances — edge.instance stays reachable across forced GC (this
- *     is what memory experiment 1 measured: zero release after load)
- *   - the notification counter is observable (getCollectedInstanceCount)
- *   - clear() restores the weak default and resets the counter
+ *   - edges are WEAK only (weak refs are the only mode — AGENTS.md
+ *     "settled facts"): edge.instance is a WeakRef
+ *     deref; once nothing else holds the instance, GC collects it, the
+ *     getter returns undefined and instanceCollected turns true
+ *   - the notification counter is observable (stats.collectedInstances)
+ *   - clear() resets the counter
  *
  * Requires --expose-gc (the test script sets NODE_OPTIONS accordingly).
  */
@@ -22,10 +19,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
 	recordCreation,
 	enterContext,
-	getTrace,
+	registerHook,
 	clear,
-	setWeakInstanceRefs,
-	getCollectedInstanceCount,
+	stats,
 } from '../src/index.js';
 import type { FlowEdge } from '../src/index.js';
 
@@ -43,8 +39,8 @@ function isInstanceAlive (edge: FlowEdge): boolean {
 // helper: its frame pops on return, so nothing above it can retain the
 // instance. Creating inside the async test body risks the suspended
 // frame's slots (post-inlining) being scanned as live roots — observed
-// empirically: identical code collected standalone in 200ms but never
-// inside vitest's async test frame (2026-09-02).
+// empirically: identical code collects standalone in ~200ms but never
+// inside vitest's async test frame.
 function createAndDrop (name: string): void {
 	const instance = { marker : name };
 	recordCreation(name, instance);
@@ -76,7 +72,7 @@ async function collectUntil (predicate: () => boolean, attempts = 60): Promise<b
 
 /**
  * Poll for instance collection WITHOUT ever dereferencing inside a
- * suspended async frame. Probed empirically (2026-09-02): an
+ * suspended async frame. Probed empirically: an
  * `edge.instance !== undefined` read inside an `async` test body pins the
  * instance for the frame's whole lifetime — V8 scans the suspended
  * frame's slots as live roots, so 30 gc() cycles collected nothing;
@@ -105,61 +101,44 @@ describe('weak instance refs', () => {
 		clear();
 	});
 
-	it('the DEFAULT mode is weak: GC releases the instance, marks the edge, keeps the skeleton', async () => {
+	it('GC releases the instance, the edge reports it collected, the skeleton stays', async () => {
 		forceGc();
-		const countBefore = getCollectedInstanceCount();
+		const countBefore = stats.collectedInstances;
+		// the create hook hands over the LIVE edge: the WeakRef going dead AND
+		// instanceCollected are both visible through its getters (there is no
+		// whole-trace copy list — hooks are the observation surface)
+		const seen: FlowEdge[] = [];
+		registerHook('create', ({ edge }) => {
+			seen.push(edge);
+		});
 		createAndDrop('WeakThing');
-		const edge = getTrace().find(item => item.name === 'WeakThing');
+		const edge = seen.find(item => item.name === 'WeakThing');
 		expect(edge).toBeDefined();
-		// Copy semantics, empirically pinned 2026-09-02: getTrace() copies
-		// are SNAPSHOTS for data props — instanceCollected lands on the
-		// LIVE edge and a pre-fetched copy never learns it — but the
-		// instance getter is shared with the live edge, so its deref going
-		// dead IS visible through the copy. Poll from sync frames only
-		// (see awaitInstanceCollected), then re-fetch for the flag.
+		// Poll from sync frames only (see awaitInstanceCollected).
 		const collected = await awaitInstanceCollected(edge!);
 		expect(collected).toBe(true);
+		expect(edge!.instanceCollected).toBe(true);
 		// The WeakRef clearing and the registry callback are SEPARATE
 		// tasks — the getter is already dead while the notification is
 		// still queued. Await the counter on its own (counter reads never
 		// deref, so an async-frame predicate is safe here).
-		const notified = await collectUntil(() => getCollectedInstanceCount() > countBefore);
+		const notified = await collectUntil(() => stats.collectedInstances > countBefore);
 		expect(notified).toBe(true);
-		const fresh = getTrace().find(item => item.name === 'WeakThing');
-		expect(fresh!.instanceCollected).toBe(true);
-		expect(fresh!.kind).toBe('create');
-		expect(fresh!.status).toBe('ok');
-		expect(fresh!.name).toBe('WeakThing');
+		expect(edge!.kind).toBe('create');
+		expect(edge!.status).toBe('ok');
+		expect(edge!.name).toBe('WeakThing');
 	});
 
-	it('strong opt-out keeps the instance reachable through the edge', async () => {
+	it('clear() resets the counter; fresh edges stay weak', async () => {
 		forceGc();
-		setWeakInstanceRefs(false);
-		createAndDrop('StrongThing');
-		const edge = getTrace().find(item => item.name === 'StrongThing');
-		expect(edge).toBeDefined();
-		// a negative assertion needs real GC pressure: poll several ticks,
-		// the pinned instance must survive all of them (single gc() calls
-		// do not reliably clear WeakRefs — that flakiness is exactly why
-		// the polling helpers exist)
-		const stillAlive = await collectUntil(() => {
-			forceGc();
-			const result = !isInstanceAlive(edge!);
-			return result;
-		}, 10);
-		expect(stillAlive).toBe(false);
-		expect(isInstanceAlive(edge!)).toBe(true);
-		expect(edge!.instanceCollected).toBeUndefined();
-	});
-
-	it('clear() restores the weak default and resets the counter', async () => {
-		forceGc();
-		setWeakInstanceRefs(false);
 		clear();
-		expect(getCollectedInstanceCount()).toBe(0);
-		// weak again: a fresh edge loses its instance to GC
+		expect(stats.collectedInstances).toBe(0);
+		const seen: FlowEdge[] = [];
+		registerHook('create', ({ edge }) => {
+			seen.push(edge);
+		});
 		createAndDrop('AfterReset');
-		const edge = getTrace().find(item => item.name === 'AfterReset');
+		const edge = seen.find(item => item.name === 'AfterReset');
 		expect(edge).toBeDefined();
 		const collected = await awaitInstanceCollected(edge!);
 		expect(collected).toBe(true);

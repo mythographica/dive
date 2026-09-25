@@ -21,7 +21,6 @@ import {
 	registerHook,
 	unregisterHook,
 	clear,
-	setTraceLimit,
 	recordCreation,
 	recordCreationError,
 	type DiveEnterPayload,
@@ -365,24 +364,6 @@ describe('registerHook: containment and lifecycle', () => {
 		expect(fired).toBe(0);
 	});
 
-	it('no events fire when the trace is disabled (traceLimit 0)', () => {
-		setTraceLimit(0);
-		let fired = 0;
-		registerHook('enter', () => {
-			fired++;
-		});
-		registerHook('leave', () => {
-			fired++;
-		});
-
-		const wrapped = wrap(function fn () {
-			return 1;
-		}, context);
-		const result = wrapped();
-
-		expect(result).toBe(1);
-		expect(fired).toBe(0);
-	});
 });
 
 describe('registerHook: create (opt-in construction edges)', () => {
@@ -468,18 +449,6 @@ describe('registerHook: create (opt-in construction edges)', () => {
 		});
 
 		clear();
-		recordCreation('MyType', { name: 'inst' });
-
-		expect(fired).toBe(0);
-	});
-
-	it('no create event fires when the trace is disabled (traceLimit 0)', () => {
-		setTraceLimit(0);
-		let fired = 0;
-		registerHook('create', () => {
-			fired++;
-		});
-
 		recordCreation('MyType', { name: 'inst' });
 
 		expect(fired).toBe(0);

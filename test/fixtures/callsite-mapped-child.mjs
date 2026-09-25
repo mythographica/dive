@@ -10,10 +10,14 @@
  * Run: node --enable-source-maps callsite-mapped-child.mjs
  * Prints a single JSON line: { "name": "<edge caption>" }.
  */
-import { wrap, getTrace } from '../../build/index.js';
+import { wrap, registerHook } from '../../build/index.js';
 
 // Inline anonymous arrow: no fn.name, no label — the caption IS the callsite.
+// The enter hook hands over the edge for reading.
+let name = '';
+registerHook('enter', ({ edge }) => {
+	name = edge.name;
+});
 wrap(() => 1)();
 
-const trace = getTrace();
-process.stdout.write(JSON.stringify({ name: trace[0].name }));
+process.stdout.write(JSON.stringify({ name }));

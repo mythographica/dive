@@ -32,12 +32,9 @@ describe('build-cjs (F12)', () => {
 			'wrap',
 			'current',
 			'getFlow',
-			'getTrace',
 			'getRunningEdges',
 			'getErrorInstance',
-			'setTraceLimit',
-			'setWeakInstanceRefs',
-			'getCollectedInstanceCount',
+			'chainDepth',
 			'registerHook',
 			'unregisterHook',
 			'clear',
@@ -56,7 +53,7 @@ describe('build-cjs (F12)', () => {
 
 	it('wrap passthrough works on the CJS instance', () => {
 		cjs.clear();
-		const before = cjs.getTrace().length;
+		const before = cjs.stats.recorded;
 		const ctx = {};
 		const wrapped = cjs.wrap(function probe () {
 			const result = 42;
@@ -64,7 +61,7 @@ describe('build-cjs (F12)', () => {
 		}, ctx);
 		const result = wrapped();
 		expect(result).toBe(42);
-		expect(cjs.getTrace().length).toBe(before + 1);
+		expect(cjs.stats.recorded).toBe(before + 1);
 		cjs.clear();
 	});
 

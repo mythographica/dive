@@ -4,14 +4,12 @@
 
 `uncaughtException` and `unhandledRejection` never know where they came from
 or *which data* caused them. Dive answers that: context is pinned to userland
-instances (**Data**), and every wrapped invocation appends an edge to a bounded
-trace (**Flow**). When the Data Flow fails, the error is pinned to its deepest
-trace edge — so the error carries both the data and the flow that happened to
-it.
+instances (**Data**), and every wrapped invocation records an edge that links
+to its parent (**Flow**). When the Data Flow fails, the error is pinned to
+its deepest trace edge — so the error carries both the data and the flow
+that happened to it.
 
 No AsyncLocalStorage. No `async_hooks`.
-
-Successor to [`context-dive`](https://www.npmjs.com/package/context-dive) (2018).
 
 ---
 
@@ -107,7 +105,7 @@ attachHooks(defaultTypes);
 
 const instance = new MyType({ requestId: 'A', data: 42 });
 // postCreation hook fires:
-//   - a 'create' edge is appended to the trace
+//   - a 'create' edge is recorded
 //   - instance methods are wrapped
 
 // Any method call runs in the instance's context
@@ -198,86 +196,6 @@ current() === instance; // true
 
 ## API
 
-### `attachHooks(collection)` — moved to `@mnemonica/otel`
-
-The mnemonica lifecycle wiring is integration-level code, not engine code. It
-ships in [`@mnemonica/otel`](https://www.npmjs.com/package/@mnemonica/otel) —
-framework-free — and the NestJS adapter re-exports it:
-
-```typescript
-import { attachHooks } from '@mnemonica/otel';
-attachHooks(collection); // preCreation + postCreation + creationError
-```
-
-This is the whole wiring, verbatim from `src/hooks/attach-hooks.ts` in
-`@mnemonica/otel` — three mnemonica lifecycle hooks driving dive's
-primitives:
-
-```typescript
-collection.registerHook('preCreation', (hookData) => {
-	const parent = hookData.existentInstance;
-	if (parent) {
-		enterContext(parent);
-	}
-	const args = hookData.args;
-	if (Array.isArray(args)) {
-		for (let i = 0; i < args.length; i++) {
-			const arg = args[i];
-			if (typeof arg === 'function' && !isWrappedFunction(arg)) {
-				args[i] = wrapConstructorArg(arg as (...a: unknown[]) => unknown, parent);
-			}
-		}
-	}
-});
-
-collection.registerHook('postCreation', (hookData) => {
-	const instance = hookData.inheritedInstance;
-	if (!instance) {
-		return;
-	}
-	if (Array.isArray(hookData.args)) {
-		for (const arg of hookData.args) {
-			upgradeConstructorArg(arg, instance);
-		}
-	}
-	recordCreation(hookData.TypeName || 'anonymous', instance, hookData.existentInstance);
-	wrapInstanceMethods(instance);
-});
-
-collection.registerHook('creationError', (hookData) => {
-	recordCreationError(
-		hookData.TypeName || 'anonymous',
-		hookData.inheritedInstance,
-		hookData.existentInstance
-	);
-});
-```
-
-What each hook buys you (from the source's own doc-comment):
-
-- **preCreation** → enter the parent (`existentInstance`) context BEFORE the
-  constructor runs, and wrap any function arguments so callbacks handed to
-  the constructor carry that context.
-- **postCreation** → record the instance's `'create'` edge via
-  `recordCreation`, then wrap the instance's methods.
-- **creationError** → record a failed `'create'` edge (`status: 'error'`)
-  under the surviving parent and pin the error to it: the failure is
-  recoverable off the error object itself.
-
-Dive exports the primitives that wiring is built from, for custom
-integrations (other frameworks, non-Nest mnemonica apps, your own lifecycle
-events):
-
-| Primitive | Called when |
-|---|---|
-| `enterContext(instance)` | a lifecycle event enters an instance's context |
-| `wrapConstructorArg(fn, context)` | a constructor receives a callback argument |
-| `upgradeConstructorArg(arg, instance)` | construction finished; unused callbacks now belong to the instance |
-| `wrapInstanceMethods(instance)` | an instance should run methods in its own context |
-| `recordCreation(name, instance, parent?)` | construction succeeded — `'create'` edge under data-flow parentage |
-| `recordCreationError(name, error, parent?)` | construction failed — error pinned to the failed edge |
-| `isWrappedFunction(fn)` | guard against double-wrapping |
-
 ### `wrap(fn, context?)` / `wrap(fn, label?)` / `wrap(fn, context, label)`
 
 ```typescript
@@ -316,9 +234,9 @@ Re-wrapping an already wrapped function follows **scope shadowing**:
 
 - `wrap(w)` or `wrap(w, sameContext)` — idempotent, returned as-is.
 - `wrap(w, differentContext)` — the callback changes ownership: a
-  `'recontext'` handoff edge is recorded on the new context (parented on the
-  old context's latest retained edge), and a fresh wrapper around the
-  ORIGINAL function is returned — wrappers never stack. Existing references
+  `'recontext'` handoff edge is recorded on the new context (parented on
+  the old context's latest retained edge), and a fresh wrapper around
+  the ORIGINAL function is returned — wrappers never stack. Existing references
   to the old wrapper keep telling the old story.
 - Function arguments crossing wrapped calls are auto-wrapped idempotently —
   they never shadow. Re-rooting is always your explicit act.
@@ -351,8 +269,10 @@ getFlow(error: Error): FlowEdge[];
 getFlow(instance: object): FlowEdge[];
 ```
 
-Reconstructs an execution branch from the trace, **oldest edge first**.
-Returns copies — mutating them does not corrupt the trace.
+Reconstructs an execution branch by walking edge-to-edge object links,
+**oldest edge first**. Returns copies — mutating them does not corrupt the
+trace. A branch reaches back exactly as far as something alive kept it: a
+held `Error`, a pending timer's closure, the context instance itself.
 
 ```typescript
 interface FlowEdge {
@@ -378,21 +298,6 @@ interface FlowEdge {
 }
 ```
 
-### `getTrace()`
-
-```typescript
-getTrace(): FlowEdge[];
-```
-
-The whole retained trace — copies of every edge still in the ring buffer,
-oldest first. Unlike `getFlow()` it needs no target: this is the inspection
-surface for tooling (remote debugging, visualization) asking "what flowed
-through this process?" when no cursor is live.
-
-Edges carry their **instance reference** — callers crossing a process
-boundary (CDP, WS, HTTP) must map to a JSON-safe shape themselves (the
-adapter's `formatFlow` shows the idiom).
-
 ### `getErrorInstance(error)`
 
 ```typescript
@@ -411,62 +316,104 @@ getRunningEdges(): FlowEdge[];
 
 The edges still `running` right now — the unfinished fibers. This is the
 suspect set for `uncaughtException` / `unhandledRejection` attribution,
-queryable in O(1) without scanning the ring. Copies, same semantics as
-`getTrace()`. Entries are born at edge creation and removed at settle
+queryable in O(1) without walking parents. Copies, same semantics as
+`getFlow()`. Entries are born at edge creation and removed at settle
 (sync return, promise settle, error mark), so the store is bounded by
-true concurrency and leaks nothing when nobody consumes it. Under a
-bounded ring it also doubles as eviction-immune storage for unfinished
-fibers.
+true concurrency and leaks nothing when nobody consumes it.
 
-### `setTraceLimit(limit)`
+Note for tooling: construction edges (`kind: 'create'`) are recorded at
+postCreation — the construction has already completed — so they are born
+settled and never appear here. `running` answers "which *calls* are still
+in flight".
 
-```typescript
-// default: Number.MAX_SAFE_INTEGER (unbounded since 2026-09-02 — retention
-// is meant to be GC-driven via weak instance refs; pass 1024 for the
-// pre-flip behavior). Safe by default because weak instance refs are the
-// default mode; opting OUT of weak refs (setWeakInstanceRefs(false)) with
-// an unbounded ring pins every instance it records — don't do that in
-// production.
-setTraceLimit(limit: number): void;
-```
-
-Sets the ring-buffer size of the trace. `0` disables recording (context
-switching still works; `getFlow()` returns empty branches). Shrinking evicts
-the oldest edges immediately.
-
-### `setWeakInstanceRefs(enable)` / `getCollectedInstanceCount()`
+### `stats`
 
 ```typescript
-// default: WeakRef (since 2026-09-02) — pass false to pin instances strongly
-setWeakInstanceRefs(enable: boolean): void;
-getCollectedInstanceCount(): number;
+stats: {
+  readonly running: number;             // edges running right now
+  readonly recorded: number;            // edges recorded this era
+  readonly collectedEdges: number;      // edges GC collected (see below)
+  readonly alive: number;               // recorded − collectedEdges
+  readonly collectedInstances: number;  // instances GC collected
+}
 ```
 
-Weak mode stores `edge.instance` as a `WeakRef` behind a getter and
-registers each instance with a `FinalizationRegistry`: when GC collects an
-instance, its edges are marked `instanceCollected: true` and the counter
-advances — a finished fiber becomes observable. The edge skeleton (ids,
-name, kind, status) stays in the ring; only the payload is released.
-Measured on the chaos fixture (60k requests, unbounded ring): strong mode
-pinned ~6.7KB/request with zero release after load; weak mode released
-all 60000 payloads and ran ~70% faster. Trade-off: `getFlow()` /
-`getErrorInstance()` on an old trace may deref to `undefined` — snapshot
-instance data at settle/error time if you need postmortem payloads.
+Read-only getter fields for tests, benchmarks, and live probes. The two
+`collected*` counters are reported by `FinalizationRegistry` callbacks, so
+they lag a GC by one task — force GC, yield one macrotask, then read.
+`clear()` starts a new era (counters reset).
+
+`alive` is the honest answer to "is anything pinning the trace": after
+load drains and GC runs, it falls to the depth of the most recent
+request's chain — the cursor holds the last edge, and each edge's parent
+link keeps its own parent alive. A fixed, chain-depth-sized residue that
+each new request replaces wholesale.
+
+### Instance references are weak
+
+`edge.instance` is a `WeakRef` deref behind a getter, and every recorded
+instance is registered with a `FinalizationRegistry` — when GC collects
+the instance, `stats.collectedInstances` advances. Retention is
+object-linked: an edge lives exactly as long as something alive keeps it —
+its instance, a held `Error` pinned to it, a pending timer's closure, or
+its own parent chain up from the cursor. There is no buffer to bound and
+no limit to tune; GC reachability IS the memory bound.
 
 **Payload survival is per-object, not per-fiber.** A fiber that carries
 ONE context instance through all its edges (the common case — one DATA
 flowing through wraps) keeps every edge's payload alive while ANY single
 reference to that instance exists anywhere: a pending timer's closure, a
 suspended `await` frame, the unwinding crash stack. Edges pointing at
-*different* instances have independent fates. Skeletons are always held
-strongly by the ring — GC never touches them.
+*different* instances have independent fates. Trade-off: `getFlow()` /
+`getErrorInstance()` on an old branch may deref to `undefined` — snapshot
+instance data at settle/error time if you need postmortem payloads.
 
 **Crash-time delivery contract:** at `uncaughtException` /
 `unhandledRejection`, the crashing fiber's payloads ARE alive (the crash
 path itself roots them) — but only until the handler returns. So extract
 and ship INSIDE the handler, synchronously; a consumer that polls later
-may find payloads collected. The ring is the live view; your crash
-handler's export (Jaeger, mnemographica) is the postmortem store.
+may find payloads collected. The live surfaces (`getRunningEdges()`,
+`stats`) are the present tense; your crash handler's export (Jaeger,
+mnemographica) is the postmortem store.
+
+### `chainDepth(target?)`
+
+```typescript
+chainDepth(target?: unknown): number;
+```
+
+`getFlow(target).length` without copying a single edge — for tests and
+benchmarks asserting how long a chain something alive keeps.
+
+### `edge.drop(...targets)`
+
+```typescript
+// on any edge returned by getFlow()/getRunningEdges()
+edge.drop();          // wipe the whole trace
+edge.drop(o1, o2, …); // remove only these objects from the trace
+```
+
+Explicit trace eviction, walked from the edge UP to the root. `drop()`
+makes the entire trace collectable now instead of whenever the objects
+happen to die: every edge on the walk loses its parent link, its object
+anchor, and its instance ref; running edges leave the running store. After
+it, `getFlow(edge)` is just `[edge]` and everything collects as soon as
+nothing outside holds it. **Price, stated plainly:** an Error pinned to
+any edge of a wiped trace keeps ONLY its own edge — `getFlow(error)` no
+longer reaches the request's story. That is the cost of the explicit
+wipe; choose the moment accordingly (after the crash handlers ran, not
+before).
+
+`drop(o1, o2, …)` is the targeted form: the same walk, but only the given
+objects are removed — edges carrying one of them lose its instance ref,
+and the object's continuation point (its anchor into the trace) is
+deleted. Edges, parent links, siblings, successors, and every other
+object stay. If the objects you name are not what anchors the trace,
+memory stays held — by design; use the walk below to see what anchors
+what.
+
+No return value; non-object arguments are ignored (and do NOT trigger a
+wipe); calling twice is a no-op.
 
 ### `clear()`
 
@@ -474,9 +421,9 @@ handler's export (Jaeger, mnemographica) is the postmortem store.
 clear(): void;
 ```
 
-Reset everything: trace, cursor, depth, context, trace limit, and the
-registered lifecycle hooks. Useful for testing — adapter-level subscribers
-must re-register after a `clear()`.
+Reset everything: object links, the running store, cursor, depth, context,
+counters, and the registered lifecycle hooks. Useful for testing —
+adapter-level subscribers must re-register after a `clear()`.
 
 ### `registerHook(event, hook)`
 
@@ -495,6 +442,9 @@ trusts external propagation. Same shape and philosophy as mnemonica's own
 `unregisterHook(event, hook)` when the closure was not kept (no-op for
 unknown hooks).
 
+Hooks fire only when an edge is recorded. Dispatch cost when nobody is
+subscribed is one length check per edge.
+
 Events:
 
 - **`enter`** — right after the edge is recorded, while `cursor` and
@@ -507,8 +457,8 @@ Events:
 - **`settle`** — when a tapped promise chain closes: `result` on resolution,
   `error` on rejection. Distinct from `leave`, so "the sync head returned" is
   never confused with "the work is done".
-- **`recontext`** — a re-wrap handoff: the callback changed ownership, and the
-  payload (`fn`, `previousContext`, `context`, plus the handoff edge) links the
+- **`recontext`** — a re-wrap handoff: the callback changed ownership, and
+  the payload (`fn`, `previousContext`, `context`, plus the handoff edge) links the
   old context's story to the new one.
 - **`create`** — *opt-in*: a construction edge recorded via
   `recordCreation`/`recordCreationError`. Deliberately **not** an `enter` —
@@ -517,8 +467,6 @@ Events:
   third-party subscribers that are **not** the adapter; `error` is set on the
   `recordCreationError` path.
 
-Hooks fire only when an edge is recorded — with `setTraceLimit(0)` no event
-fires. Dispatch cost when nobody is subscribed is one length check per edge.
 Subscriber exceptions are contained per-subscriber: a throwing hook degrades
 its own observability, never the trace.
 
@@ -527,13 +475,13 @@ import { registerHook } from '@mnemonica/dive';
 
 // correlate an OTel span with every wrapped call
 registerHook('enter', ({ edge, args }) => {
-	const span = tracer.startSpan(edge.name);
-	(edge as Record<symbol, unknown>)[SPAN] = span;
+  const span = tracer.startSpan(edge.name);
+  (edge as Record<symbol, unknown>)[SPAN] = span;
 });
 registerHook('settle', ({ edge, error }) => {
-	const span = (edge as Record<symbol, unknown>)[SPAN] as Span | undefined;
-	if (error) span?.recordException(error);
-	span?.end();
+  const span = (edge as Record<symbol, unknown>)[SPAN] as Span | undefined;
+  if (error) span?.recordException(error);
+  span?.end();
 });
 ```
 
@@ -565,27 +513,80 @@ switcher is never used for parentage.
 
 ---
 
-## Stress Test
+## Long-lived objects keep their whole story
 
-A stress scenario proves context survival across random async boundaries. It
-is a test fixture (`test/stress/`), not a published entry point — run it with
-`npm test` or read it as a worked example.
+Retention is per context object. A short-lived request instance collects
+the moment nothing references it — but an object that lives for the whole
+process (a service singleton, a connection pool, a cache) accumulates
+**one chain link per wrapped call made on it**, and the whole chain stays
+reachable for as long as the object does. Measured (`test/long-lived-chain.spec.ts`,
+100,000 finished wrapped calls, forced GC between phases):
 
-Flow:
-1. Create 100 `StressEntity` instances with random values (each carries its
-   `uuid` and `requestId` in its own data — no side maps)
-2. Fisher-Yates shuffle, register 70% to global registry
-3. Random consumer picks instances (20–100ms intervals)
-4. ~55% success | ~17% sync throw | ~14% async reject | ~14% nested construction
-5. Failures happen INSIDE wrapped boundaries → self-pinned errors
-6. DLQ collects failures; every entry derives `requestId`/`uuid` from
-   `getErrorInstance(error)` and proves a non-empty `getFlow(error)`
+| Scenario | `stats.alive` after GC | `stats.collectedEdges` | heap |
+|---|---|---|---|
+| one object held for the whole run | 100,000 | 0 | 35.8 MB |
+| a fresh short-lived object per call | 0 | 100,000 | 15.4 MB |
+| one held object, then `edge.drop(obj)` on the newest edge | 0 | 100,000 | 19.5 MB |
+| one held object, then `edge.drop()` on the newest edge | 0 | 100,000 | 15.6 MB |
 
-**Key result:** every failure is traceable back to the originating request —
-data AND flow — even though instances were shuffled, queued, and processed
-seconds later. The `test/uncaught-real.spec.ts` child-process test proves the
-same across REAL `uncaughtException` / `unhandledRejection` boundaries, where
-ALS's ambient store is gone.
+In both drop rows the object itself stays held — after the drop its
+continuation point is gone (`chainDepth(obj)` is 0) and its next call
+starts a fresh story at depth 1. On a single-object trace the targeted and
+the full wipe converge (every edge carried that object, and its anchor was
+the trace's only root); with several objects on one trace, `drop(obj)`
+keeps the other objects' edges named and linked while `drop()` does not.
+
+So budget long-lived contexts: each retained call costs ~200 B, collected
+only when the object itself dies. The request-scoped pattern (a fresh
+context instance per request — what the mnemonica wiring gives you for
+free) never accumulates, because request objects are short-lived by
+construction. A service that must be long-lived and is wrapped heavily can
+instead pass a fresh lightweight context per operation:
+
+```typescript
+// the service lives; the trace context does not accumulate on it
+setTimeout(wrap(() => sweep(cache), { sweep: i++ }), 1000);
+```
+
+And when you choose to keep a long-lived object but not its whole
+history, `edge.drop(obj)` removes that object from its trace — edges and
+links stay, the object is unnamed and unanchored. `edge.drop()` wipes the
+whole trace and makes it collectable on the next GC round — at a stated
+price: Errors pinned into
+a wiped trace keep only their own edge, so wipe after the crash handlers
+ran, never before.
+
+Reproduce the numbers yourself from the repository:
+
+```bash
+npm test -- test/long-lived-chain.spec.ts   # the npm script supplies --expose-gc
+```
+
+---
+
+## How to check what holds memory
+
+Running traces are observable — walk from the counters to the anchor:
+
+1. **`stats.alive` vs `stats.running`.** If `alive` grows at rest while
+   `running` is 0, finished chains are being pinned somewhere.
+2. **`chainDepth(obj)` on your suspects.** A depth that grows with every
+   call on one object names the accumulator (see the section above).
+3. **`getFlow(obj)`** walks the linked list newest → root: each edge shows
+   `kind`, `name`, and the instance it happened to — you see exactly which
+   object anchors the chain and which calls built it.
+4. Choose at the anchor — this retention is by design, and the choice is
+   yours: keep the story (a long-lived object's history is often exactly
+   what you want), give the long-lived work a fresh per-operation context
+   (the pattern above), or evict explicitly once you know what you are
+   holding — `edge.drop(obj)` removes one object from the trace (edges
+   stay, links stay); `edge.drop()` wipes the whole trace and makes it
+   collectable on the next GC round. Remember the wipe's price: Errors
+   pinned into a wiped trace keep only their own edge, so wipe after your
+   crash handlers have run, not before.
+
+`stats.collected*` counters lag a GC by one task: force GC, yield one
+macrotask, then read.
 
 ---
 
@@ -602,8 +603,12 @@ startup, and every mnemonica instance created while serving a request becomes
 context automatically (the instance **is** the context). At decoupled
 boundaries (queues, timers, emitters), `wrap()` the callback with the
 instance it processes — the failure will then carry the data and the flow.
-For anything else, the integration primitives (see API) let you wire dive
-into your own lifecycle events.
+For anything else, the integration primitives (`enterContext`,
+`wrapConstructorArg`, `upgradeConstructorArg`, `wrapInstanceMethods`,
+`recordCreation`, `recordCreationError`) let you wire dive into your own
+lifecycle events — the full wiring source ships in
+[`@mnemonica/otel`](https://www.npmjs.com/package/@mnemonica/otel) as
+`attachHooks`.
 
 ---
 
@@ -617,42 +622,7 @@ into your own lifecycle events.
 | Random queue shuffle | ❌ No traceability | ✅ Every failure carries data + flow |
 | Nested construction error | ❌ No parent context | ✅ Parent in error |
 | Concurrent interleaved flows | ✅ Auto-isolated | ✅ Trace isolates; bare `current()` is newest-wins (documented) |
-| Memory overhead | One store per async resource | Bounded ring buffer (`setTraceLimit`) |
-
----
-
-## The async_hooks Isomorphism
-
-Dive knowingly re-uses the **shape** of async_hooks — and inverts what it
-attaches to:
-
-| async_hooks | dive |
-|---|---|
-| `asyncId` | edge `id` |
-| `triggerAsyncId` | edge `parentId` |
-| `executionAsyncId()` | the trace `cursor` |
-| `init` / `before` / `after` / `destroy` | `wrap()` entry/exit bookkeeping |
-| `AsyncLocalStorage` store | `lastContext` behind `current()` |
-
-The difference is the attachment point. async_hooks parents the graph on
-**async resources** — timers, promises, I/O handles the runtime created — and
-instruments *everything* from inside the runtime, whether you asked or not;
-`AsyncLocalStorage` then tries to filter that noise back down. Dive parents
-the graph on **invocations carrying data** — and wraps only what you
-explicitly wrapped, from userland. The default is silence; you pay per wrap.
-
-This is also why dive survives the synchronous split
-([nodejs/diagnostics#249](https://github.com/nodejs/diagnostics/issues/249))
-that breaks async_hooks-based CLS: at a sync boundary no async resource is
-created, so there is nothing to hook — but the invocation still happens, and
-dive's context lives on the instance, not on the resource.
-
-There is a cautionary prequel here. In the diagnostics-WG era, Thomas Watson
-described monkeypatching Node's own bootstrap — down at the serializer layer
-— to wrap everything for tracing. The result was combinatorial bloom:
-instrument-everything pays for *everything*, and the traces drown in their
-own exhaust. Dive's answer to that story is the opt-in model: the same graph
-shape, but hung from data you chose, at boundaries you chose.
+| Memory overhead | One store per async resource | Object-linked edges — GC reachability is the bound |
 
 ---
 
@@ -677,9 +647,14 @@ Auto-wrapping every boundary causes a **cyclomatic / combinatory explosion** —
 and it is not just performance overhead, it is **correctness overhead**. Deep
 auto-wrapping:
 
-- Wraps user-intentional plain objects (false positives)
-- Breaks library code that expects unwrapped references
-- Creates memory leaks if we hold strong refs to every returned object
+- **Loses intent**: Is a wrapped callback intentional context propagation, or
+  an accidental side effect of aggressive instrumentation?
+- **Creates noise**: In a heavily async system (event-driven I/O, streams,
+  timers), 90% of execution flow is plumbing, not business logic.
+- **Breaks isolation**: Wrapping `setTimeout` globally can interfere with
+  libraries that rely on precise callback timing or unwrapped behavior.
+- **Hides bugs**: If EVERY function is wrapped, errors become attributed to
+  dive's internals rather than the user's actual code path.
 
 ### Manual Wrapping Is the Escape Hatch
 
@@ -772,228 +747,20 @@ every library propagates perfectly, and already gone when `uncaughtException`
 fires. Dive pins to the **object graph** — which is why attribution survives
 process-level escapes and arbitrary queue reordering.
 
-### Falsifiable, not "trust us"
+### The CJS/ESM instance split
 
-Every claim above is gated by a script that exits non-zero on any
-misattribution:
-
-| Proof | Where | What it gates |
-|-------|-------|---------------|
-| Stress suite | `npm test`, this repo | shuffle + queue + DLQ attribution; real process-level escapes in a child process |
-| `load:proof` | FineCut pilot (`finecut/nest-dive`) | 200 unique-marker crashes over real TCP, 50 in flight, zero misattribution |
-| `proof:queue` | FineCut pilot (`finecut/nest-dive`) | 140 markers through a random-order, random-delay queue — request 42 stays 42 |
-
-Falsifiable means there is a way to research further — not that nothing
-works. Something works, and these instruments will say so the day it stops.
+The package dual-builds: `import` resolves to `build/` (ESM), `require` to
+`build-cjs/` (CJS). Dive's trace state is module-level, so the two flavors
+are **separate instances in the same process**: edges recorded through the
+ESM entry are invisible to a `require('@mnemonica/dive')` reader, and vice
+versa. As a user, just know that if your code mixes both entry styles (rare,
+but e.g. an ESM app inspected by a `createRequire`-based tool), the two
+sides see different traces. Pick one entry style per process and stay with it.
 
 ---
 
-## History
+## Repository Layout
 
-- **2018:** [`context-dive`](https://www.npmjs.com/package/context-dive) —
-  `async_hooks` + manual callback patching (the HolyJS 2018 talk package)
-- **2020:** `AsyncLocalStorage` — native Node.js, 90% coverage
-- **2025:** `@mnemonica/dive` v0.1 — object-bound context, no ALS
-  (single-global switcher)
-- **2026:** v0.2 redesign — the switcher demoted to a cursor over a bounded
-  execution-flow trace; construction edges parent on the data-flow lineage;
-  the identifier-map subsystem (`link`/`unlink`) removed — the data carries
-  its own identity, and errors carry the data. API simplified to 7 functions.
-- **2026:** v0.3 — the engine/adapter split, completed. Dive is a palette of
-  wrappers and imports nothing at all; the mnemonica-specific `attachHooks`
-  moved to `@mnemonica/nestjs`, rebuilt from dive's exported integration
-  primitives. `thunderstruck` (pre-root payload collection) moved out with
-  it — dive was never meant to be a storage. The adapter keeps those
-  payloads in a `WeakMap` keyed on request objects: GC is the only release,
-  and retention is exactly the request's lifetime.
-- **2026:** async edge closure — the promise tap now closes the edge
-  (`'ok'` + full-lifetime `duration`) when the whole chain settles, and
-  `'running'` means *genuinely unsettled*. The domain vocabulary
-  (statuses, kinds, fallback names) was hoisted to single-definition
-  constants.
-
-Motivation: [nodejs/diagnostics#249](https://github.com/nodejs/diagnostics/issues/249) —
-synchronous execution splits break `async_hooks`-based CLS.
-
-The design decision log — considered-and-rejected alternatives, parked
-designs, and when to revisit them — lives in
-[DECISIONS.md](https://github.com/mythographica/dive/blob/main/DECISIONS.md) in the repository.
-
----
-
-## Internals
-
-The store is four parts (no `async_hooks`):
-
-- `edges` — a `Map<id, FlowEdge>` ordered by insertion. Since 2026-09-02
-  the default is **unbounded** (`setTraceLimit` opts back into a bounded
-  ring; 1024 was the old default) and instance refs are **weak by
-  default**: `edge.instance` is a `WeakRef` deref and GC reachability is
-  the memory bound, with the `FinalizationRegistry` marking collected
-  instances on their edges. `setWeakInstanceRefs(false)` opts back into
-  strong refs — edges then pin their instances, so bound the ring if you
-  do that.
-- `cursor` — the id of the edge executing right now (`null` at rest), plus
-  `activeDepth` tracking how deep we are inside wrapped invocations. Depth
-  decides parentage (see "The Execution-Flow Trace").
-- `latestEdge` — a `WeakMap<instance, edgeId>` with each instance's most
-  recent edge, so construction and method calls continue the instance's own
-  story. Weak, so instances are never pinned by this map.
-- `lastContext` — the "newest-wins" switcher behind `current()`. Deliberately
-  NOT used for trace parentage: concurrent flows may clobber the switcher,
-  but they cannot corrupt the trace.
-
-Context also rides on **error objects** via two non-enumerable symbol
-properties (`mnemonica.dive.edge`, `mnemonica.dive.instance`), pinned once at
-the deepest wrapped boundary the error passes through — which is how data and
-flow survive to `uncaughtException` / `unhandledRejection` handlers where
-ALS's ambient store is already gone.
-
-Method wrapping is applied to the instance's immediate **prototype**, using
-`this` (the receiver) as the context. For plain classes — where many instances
-share one prototype — each method is wrapped ONCE. Mnemonica gives every
-instance its own immediate prototype, so for mnemonica instances this is still
-per-instance; it is not worse, just not a win.
-
----
-
-## License
-
-MIT
-
----
-
-# Explanation
-
-This is the whole machinery in execution order. The implementation is one
-file (`src/index.ts`, ~630 lines, no imports).
-
-## 0. The shape
-
-Dive is not a class or an object — it's **module-level mutable state plus
-functions**. The entire store is five `let` bindings at the top of the file:
-
-- `edges: Map<id, FlowEdge>` — the trace itself (a ring buffer; the oldest
-  entries are evicted past `traceLimit`)
-- `latestEdge: WeakMap<instance, edgeId>` — "where this instance's story
-  last continued"
-- `cursor: number | null` — the edge executing **right now**
-- `activeDepth: number` — how many wrapped invocations deep we are
-- `lastContext` — the newest-wins switcher behind `current()`
-
-## 1. The entrypoint
-
-There is no start function. Dive is inert until **a wrapped function is
-invoked**. In a mnemonica app the *wiring* entrypoint is
-`attachHooks(collection)` (adapter side), which registers mnemonica
-lifecycle hooks — but those hooks themselves only call dive primitives. So
-the real entrypoint, always, is: **somebody calls a function that `wrap()`
-returned.**
-
-## 2. `wrap(fn, context?)` — the heart
-
-Two phases. **Wrap time** (once): capture the context — explicit argument,
-or whatever `lastContext` is right then. Already-wrapped functions pass
-through untouched.
-
-**Call time** — every invocation of the wrapped function:
-
-1. Save `previousContext` / `previousCursor`; set
-   `lastContext = capturedContext`.
-2. `recordEdge(...)` appends a `FlowEdge`
-   `{id, parentId, instance, name, kind, ts, status:'running'}`. The parent
-   comes from `executionParent(context)` — see step 3 below.
-3. `cursor = edge.id; activeDepth++` — we are now inside a wrapped
-   invocation.
-4. **Wrap the args**: any function passed *into* this call gets wrapped
-   with the same context — context propagates **down**.
-5. Call the real `fn` — via `Reflect.construct` if invoked with `new`.
-6. If the result is a **function**, wrap it — context propagates
-   **forward**.
-7. If the result is a **Promise**, tap it: the edge closes
-   (`'ok'` + full-lifetime duration) when the whole chain settles — a
-   promise never resolves *to* a promise, the runtime flattens thenables
-   before the tap fires, so promise-in-promise needs no wrapping of its
-   own — resolved functions get wrapped, rejections get
-   `pinError(error, edge, context)` then re-throw.
-8. Sync throw → `pinError`, rethrow.
-9. `finally`: restore `cursor`, `activeDepth--`, restore `lastContext`
-   (for promises, `duration` is stamped at settlement by step 7's tap).
-   The state machine is back exactly where the caller left it.
-
-Steps 4+6 are the ALS replacement: propagation is not ambient, it's
-**viral through values** — every wrapped call wraps its inputs and outputs,
-so context chains to any depth without touching the runtime.
-
-## 3. The parentage rule — `executionParent`
-
-- **`activeDepth > 0`**: we're truly nested inside another wrapped call →
-  parent is the `cursor`. "Y called X" is recorded as it happened.
-- **`activeDepth === 0`**: we entered from an **unwrapped boundary**
-  (setTimeout fired, emitter called, route handler) — the cursor may be a
-  stale edge from some *other* request. So the edge parents on the
-  **data**: `latestEdge.get(context)` — the context instance's own most
-  recent edge.
-
-This is the line that makes the queue proof possible: interleaved requests
-can clobber `lastContext` and even the cursor, but a fresh edge at a
-boundary continues *its instance's* story, never a stranger's.
-
-## 4. The error path — `pinError`
-
-Every edge an error propagates through gets `status = 'error'` — but the
-error **object** is pinned only **once** (if the symbol's already there,
-return). Deepest boundary wins; outer re-throws can't overwrite the failure
-site. Two non-enumerable symbols go onto the error: `mnemonica.dive.edge`
-(edge id) and `mnemonica.dive.instance` (the data). That's the whole trick
-behind crash attribution: the error *carries* its provenance, so
-`uncaughtException` — where ALS's store is long dead — can still recover
-everything.
-
-## 5. The read paths
-
-- `current()` — just `lastContext`. Honest but newest-wins; ambiguous under
-  concurrency by design.
-- `getFlow(target)` — resolve a starting edge (cursor / error's pinned
-  edge / instance's latest edge), then walk `parentId` upward, `unshift`ing
-  into an array → the branch, oldest first.
-- `getErrorInstance(err)` — pinned instance; fallback: the instance of the
-  pinned edge.
-
-## 6. How mnemonica instances enter the picture — `attachHooks` (adapter)
-
-- **preCreation**: `enterContext(parent)` + `wrapConstructorArg` on
-  function args — callbacks handed to a constructor carry context, via a
-  mutable holder so they can be re-pointed at the not-yet-built instance.
-- **postCreation**: `recordCreation(name, instance, parent)` → a `create`
-  edge parented on the *parent instance's* latest edge (data-flow lineage);
-  then `wrapInstanceMethods(instance)` redefines every method on the
-  instance's immediate prototype with the same bookkeeping as `wrap()` but
-  `kind:'method'` and **context = the receiver `this`**;
-  `upgradeConstructorArg` re-points unused arg callbacks at the built
-  instance.
-- **creationError**: `recordCreationError` — a failed `create` edge under
-  the surviving parent, error pinned to it.
-
-## 7. End-to-end: one queue-proof request
-
-1. `POST /proof` → `new ProofEntity({uuid, marker, expect})`.
-   preCreation/postCreation fire → `create:ProofEntity` edge; `process`
-   gets wrapped on the prototype. HTTP response leaves. *Request cycle
-   over.*
-2. Seconds later, a `setTimeout` tick fires (unwrapped boundary, depth 0) →
-   `instance.process()` → wrapped method records `method:process`,
-   **parented on that instance's own `create` edge**, not on whatever ran
-   last.
-3. `await` random delay → `throw` for marker 57 → the promise tap pins the
-   error to *this* edge + *this* instance → rethrows.
-4. The queue's `catch` calls `recordFailure(err)` →
-   `getErrorInstance(err)` → the instance → `utils.extract` →
-   `{uuid, marker}` → outcome stored.
-5. `GET /proof/:uuid` reads it back. The script asserts the marker matches
-   what *it* sent — which it can only do if step 2's parentage and step 3's
-   pinning never crossed wires.
-
-That's the whole loop: **wrap at boundaries, record edges, parent on data,
-pin errors once, read from the error.** Everything else in the file
-(`setTraceLimit`, `clear`) is housekeeping.
+The published package is `build/` + `build-cjs/` + this README + LICENSE.
+For maintainers — internals, invariants, and how to work on dive itself —
+see `AGENTS.md` in the repository.

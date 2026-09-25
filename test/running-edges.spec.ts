@@ -1,5 +1,5 @@
 /**
- * The running-edges store (2026-09-02 — reports/running-edges-store-design.md).
+ * The running-edges store (design note: reports/running-edges-store-design.md).
  *
  * The semantics under test:
  *
@@ -7,9 +7,8 @@
  *   - settle removes it: sync return, promise resolve, promise reject,
  *     error mark — the four transition sites
  *   - the store is an index of status === 'running', queryable via
- *     getRunningEdges() without scanning the ring
- *   - bounded-ring eviction does NOT remove a running edge from the store
- *     (eviction-immune secondary storage for unfinished fibers)
+ *     getRunningEdges(), and dive's ONLY strong root over edges: a running
+ *     edge is never collectable
  *   - clear() empties it
  *
  * Lookup note: wrapped-call edges are named by CALLSITE, not by the wrap
@@ -23,9 +22,8 @@ import {
 	wrap,
 	recordCreation,
 	getRunningEdges,
-	getTrace,
+	getFlow,
 	clear,
-	setTraceLimit,
 } from '../src/index.js';
 import type { FlowEdge } from '../src/index.js';
 
@@ -44,8 +42,8 @@ describe('running edges store', () => {
 		const ctx = { id : 'sync' };
 		const fn = wrap(() => 42, ctx);
 		fn();
-		// sanity: the edge exists in the trace (lookup is not vacuous)
-		expect(byContext(getTrace(), ctx)).toBeDefined();
+		// sanity: the edge exists in the flow (lookup is not vacuous)
+		expect(byContext(getFlow(ctx), ctx)).toBeDefined();
 		expect(byContext(getRunningEdges(), ctx)).toBeUndefined();
 	});
 
@@ -73,7 +71,7 @@ describe('running edges store', () => {
 			throw new Error('boom');
 		}, ctx);
 		expect(() => fn()).toThrow('boom');
-		expect(byContext(getTrace(), ctx)).toBeDefined();
+		expect(byContext(getFlow(ctx), ctx)).toBeDefined();
 		expect(byContext(getRunningEdges(), ctx)).toBeUndefined();
 	});
 
@@ -82,27 +80,6 @@ describe('running edges store', () => {
 		const fn = wrap(() => Promise.reject(new Error('async boom')), ctx);
 		const caught = fn().catch((error: Error) => error);
 		await caught;
-		await Promise.resolve();
-		expect(byContext(getRunningEdges(), ctx)).toBeUndefined();
-	});
-
-	it('ring eviction does not remove a still-running edge (bounded ring)', async () => {
-		const ctx = { id : 'evicted-but-running' };
-		let resolveIt: () => void = () => undefined;
-		const gate = new Promise<void>((resolve) => {
-			resolveIt = resolve;
-		});
-		const fn = wrap(() => gate, ctx);
-		fn();
-		// bound the ring and push the running edge out of it
-		setTraceLimit(2);
-		recordCreation('NewerA', { id : 'a' });
-		recordCreation('NewerB', { id : 'b' });
-		expect(byContext(getTrace(), ctx)).toBeUndefined();
-		// ...but the store still holds the skeleton until settle
-		expect(byContext(getRunningEdges(), ctx)).toBeDefined();
-		resolveIt();
-		await gate;
 		await Promise.resolve();
 		expect(byContext(getRunningEdges(), ctx)).toBeUndefined();
 	});

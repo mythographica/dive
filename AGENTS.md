@@ -61,13 +61,16 @@ Charter-level constraints (settled — do not re-litigate):
   Depth === 0 (unwrapped boundary): parent is the context instance's latest
   edge — the data's own story, never the possibly-stale cursor. This is
   what makes cross-request clobbering structurally impossible.
-- **The cursor/lastContext residue is current behavior, not a bug.** At
-  rest the cursor holds the last executed edge and `lastContext` (behind
-  `current()`) the last constructed instance; each roots its own chain via
-  the WeakMap value-retention. After load + GC, `stats.alive` falls to the
-  most recent request's chain depth — a fixed, chain-depth-sized residue
-  (~1.7–2.3 KB) that each new request replaces wholesale. Do not "fix" it;
-  document it.
+- **The `lastContext` residue is current behavior, not a bug.** At rest
+  the cursor is `null` (leave restores the previous cursor; `getFlow()`
+  with no target is empty at rest). `lastContext` (behind `current()`)
+  keeps the newest top-level construction: constructions set it without
+  restore, while a wrapped call's leave rolls it back. That instance roots
+  its latest edge (`latestEdges`) and, through the parent links, that
+  edge's chain. After load + GC, `stats.alive` falls to that chain's depth
+  — a fixed, chain-depth-sized residue (~1.7–2.3 KB) that each new
+  top-level construction replaces wholesale. Do not "fix" it; document it.
+  For crash attribution it is a labelled guess, never evidence.
 - **Errors pin once, deepest boundary wins.** Every edge an error passes
   through gets `status: 'error'`, but the error OBJECT is pinned (edge +
   instance symbols) only at the first/deepest wrapped boundary; outer
@@ -165,8 +168,8 @@ The store is object-linked (no `async_hooks`, no buffer):
   leaves it at settle. This is the `getRunningEdges()` surface.
 - `cursor` — the edge executing right now (`null` at rest), plus
   `activeDepth` tracking how deep we are inside wrapped invocations. Depth
-  decides parentage. At rest the cursor keeps the most recent request's
-  chain reachable — the documented residue.
+  decides parentage. Leave restores the previous cursor, so nothing is
+  kept at rest; the documented residue lives in `lastContext`.
 - `lastContext` — the "newest-wins" switcher behind `current()`. Deliberately
   NOT used for trace parentage: concurrent flows may clobber the switcher,
   but they cannot corrupt the trace.

@@ -9,7 +9,7 @@
  * the flow that happened to it. No AsyncLocalStorage, no async_hooks.
  *
  * Dive is framework- and library-agnostic: it imports nothing at all.
- * The mnemonica hook wiring (attachHooks) lives in @mnemonica/nestjs — dive
+ * The mnemonica hook wiring (attachHooks) lives in @mnemonica/otel — dive
  * only exports the primitives that wiring is built from.
  *
  * Public API:
@@ -39,9 +39,9 @@
  * the GC decides how long history lives):
  *   - parents: WeakMap<edge, edge> — successor → predecessor: a live edge
  *     keeps its ancestors; nothing keeps siblings
- *   - cursor: the edge executing right now. Between invocations it still
- *     holds the last executed edge, which keeps that request's chain alive —
- *     the fixed rest residue (see stats.alive)
+ *   - cursor: the edge executing right now. NO rest residue: leave restores
+ *     the previous cursor (src/index.ts:993, 1204) and it is null at the top
+ *     level (:531) — getFlow() with no target is empty at rest
  *   - activeDepth: how deep we are inside wrapped invocations; depth > 0 means
  *     the cursor is a truthful execution parent, depth === 0 means we entered
  *     from an unwrapped boundary (timer, emitter, route handler) and parentage
@@ -50,8 +50,11 @@
  *     so construction and method calls continue the instance's own story
  *   - lastContext: the "newest-wins" switcher behind current(); deliberately
  *     NOT used for flow parentage, so concurrent flows cannot corrupt the
- *     graph. Between constructions it still holds the last constructed
- *     instance — the same fixed rest residue as the cursor
+ *     graph. Unlike the cursor it DOES keep a rest residue: constructions
+ *     set it without restore (enterContext, :650), a wrapped call's leave
+ *     rolls it back (:995, :1206) — so at rest it holds the newest top-level
+ *     construction in the process (any request): a labelled guess for
+ *     attribution, never evidence
  */
 
 const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');

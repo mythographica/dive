@@ -23,26 +23,29 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const childScript = path.join(here, 'fixtures', 'uncaught-child.mjs');
 
 function runChild (mode: 'throw' | 'reject') {
-	const out = execFileSync(process.execPath, [childScript, mode], { encoding: 'utf8' });
-	return JSON.parse(out) as {
+	const out = execFileSync(process.execPath, [ childScript, mode ], { encoding : 'utf8' });
+	const report = JSON.parse(out) as {
 		via           : string;
 		alsInHandler  : string | null;
 		diveInHandler : string | null;
 		flowKinds     : string[];
 		flowStatus    : string[];
 	};
+	return report;
 }
 
 describe('REAL crash boundary: dive vs ALS (decoupled consumer)', () => {
 	it('uncaughtException: dive recovers the data AND the flow; ALS store is gone', () => {
 		const r = runChild('throw');
 		expect(r.via).toBe('uncaughtException');
-		expect(r.alsInHandler).toBeNull(); // ALS: ambient store gone
-		expect(r.diveInHandler).toBe('origin-instance'); // dive: data on the error
-		expect(r.flowKinds).toEqual(['create:Entity', 'method:process']);
+		// ALS: ambient store gone
+		expect(r.alsInHandler).toBeNull();
+		// dive: data on the error
+		expect(r.diveInHandler).toBe('origin-instance');
+		expect(r.flowKinds).toEqual([ 'create:Entity', 'method:process' ]);
 		// create edge is 'ok': construction honestly completed (0.6.1 closes
 		// create edges at postCreation); the method edge carries the error
-		expect(r.flowStatus).toEqual(['ok', 'error']);
+		expect(r.flowStatus).toEqual([ 'ok', 'error' ]);
 	});
 
 	it('unhandledRejection: dive recovers the data AND the flow; ALS store is gone', () => {
@@ -50,7 +53,7 @@ describe('REAL crash boundary: dive vs ALS (decoupled consumer)', () => {
 		expect(r.via).toBe('unhandledRejection');
 		expect(r.alsInHandler).toBeNull();
 		expect(r.diveInHandler).toBe('origin-instance');
-		expect(r.flowKinds).toEqual(['create:Entity', 'method:processAsync']);
-		expect(r.flowStatus).toEqual(['ok', 'error']);
+		expect(r.flowKinds).toEqual([ 'create:Entity', 'method:processAsync' ]);
+		expect(r.flowStatus).toEqual([ 'ok', 'error' ]);
 	});
 });

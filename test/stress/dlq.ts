@@ -53,12 +53,13 @@ export function produceReport () : DlqReport {
 		}
 	}
 
-	return {
+	const report : DlqReport = {
 		total     : DLQ.length,
 		byType    : Object.fromEntries(byType) as Record<ErrorType, number>,
 		byRequest : Object.fromEntries(byRequest),
 		samples,
 	};
+	return report;
 }
 
 export function pushToDlq (params: {

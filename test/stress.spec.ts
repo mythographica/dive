@@ -33,7 +33,7 @@ describe('dive stress test', () => {
 		expect(result.report.total).toBeGreaterThan(0);
 
 		// Every failure must be traceable back to the same request
-		for (const [req, count] of Object.entries(result.report.byRequest)) {
+		for (const [ req, count ] of Object.entries(result.report.byRequest)) {
 			expect(req).toBe(result.requestId);
 			expect(count).toBeGreaterThan(0);
 		}
@@ -55,6 +55,6 @@ describe('dive stress test', () => {
 		// Every DLQ entry carries the original requestId
 		const requests = Object.keys(result.report.byRequest);
 		expect(requests.length).toBe(1);
-		expect(requests[0]).toBe(result.requestId);
+		expect(requests[ 0 ]).toBe(result.requestId);
 	}, 12000);
 });

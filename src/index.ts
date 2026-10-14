@@ -26,7 +26,8 @@
  *   dive.unregisterHook(ev, cb)   → detach an exact subscriber by reference
  *   dive.clear()                  → reset everything (testing)
  *
- * Integration primitives (for adapter-level wiring, e.g. @mnemonica/nestjs):
+ * Integration primitives (the wiring that uses them is @mnemonica/otel's
+ * attachHooks):
  *   dive.enterContext(instance)        → switch the current() context
  *   dive.wrapConstructorArg(fn, ctx)   → wrap a constructor arg, upgradeable context
  *   dive.upgradeConstructorArg(arg, i) → upgrade an unused arg callback to the instance
@@ -40,8 +41,10 @@
  *   - parents: WeakMap<edge, edge> — successor → predecessor: a live edge
  *     keeps its ancestors; nothing keeps siblings
  *   - cursor: the edge executing right now. NO rest residue: leave restores
- *     the previous cursor (src/index.ts:993, 1204) and it is null at the top
- *     level (:531) — getFlow() with no target is empty at rest
+ *     the previous cursor (the finally blocks of wrap() and
+ *     wrapInstanceMethods()) and it is null at the top level (its declared
+ *     initial value; edge.drop() also clears it when it points into the
+ *     dropped chain) — getFlow() with no target is empty at rest
  *   - activeDepth: how deep we are inside wrapped invocations; depth > 0 means
  *     the cursor is a truthful execution parent, depth === 0 means we entered
  *     from an unwrapped boundary (timer, emitter, route handler) and parentage
@@ -51,10 +54,10 @@
  *   - lastContext: the "newest-wins" switcher behind current(); deliberately
  *     NOT used for flow parentage, so concurrent flows cannot corrupt the
  *     graph. Unlike the cursor it DOES keep a rest residue: constructions
- *     set it without restore (enterContext, :650), a wrapped call's leave
- *     rolls it back (:995, :1206) — so at rest it holds the newest top-level
- *     construction in the process (any request): a labelled guess for
- *     attribution, never evidence
+ *     set it without restore (enterContext), a wrapped call's leave rolls
+ *     it back (the same two finally blocks as the cursor) — so at rest it
+ *     holds the newest top-level construction in the process (any request):
+ *     a labelled guess for attribution, never evidence
  */
 
 const SymbolDiveInstance = Symbol.for('mnemonica.dive.instance');
@@ -89,6 +92,21 @@ const FN_NAME = 'name';
 
 export type FlowKind = 'create' | 'call' | 'construct' | 'method' | 'recontext';
 export type FlowStatus = 'running' | 'ok' | 'error';
+
+/**
+ * Any wrap()-able callable, parameter-broad form for the internal machinery
+ * (the runtime casts when a value of unknown provenance enters a wrap).
+ * Module-internal — the public signatures speak AnyFn.
+ */
+type WrappedFn = (...args: unknown[]) => unknown;
+
+/**
+ * wrap()'s public constraint: ANY callable, typed params included — the
+ * caller's parameter types are the caller's business; the wrapper forwards
+ * them untouched. (never[] accepts every parameter list, so the generic T
+ * keeps the caller's exact signature.)
+ */
+export type AnyFn = (...args: never[]) => unknown;
 
 /**
  * How an edge's instance was attributed. 'explicit' — the caller passed the
@@ -154,6 +172,14 @@ export interface FlowEdge {
 // the built instance it belongs to. `used` is set the moment it is invoked.
 interface DiveArgHolder { context: object | undefined; used: boolean; }
 
+// The arg-holder shape, proven by structure (Symbol.for keys are `symbol`,
+// never `unique symbol` — no interface can key them, so `in` + field checks
+// do the narrowing)
+const isDiveArgHolder = function (value: unknown): value is DiveArgHolder {
+	const matches = typeof value === 'object' && value !== null && 'used' in value && 'context' in value;
+	return matches;
+};
+
 /**
  * Edge lifecycle hooks — dive PUBLISHES its ground truth (emission, never
  * ingestion). ALS/OTel vendors subscribe and correlate from THEIR side at the
@@ -206,7 +232,7 @@ export interface DiveSettlePayload {
 
 export interface DiveRecontextPayload {
 	edge            : FlowEdge;
-	fn              : (...args: unknown[]) => unknown;
+	fn              : AnyFn;
 	previousContext : object | undefined;
 	context         : object | undefined;
 }
@@ -239,7 +265,7 @@ export function registerHook (event: 'settle', hook: DiveHook<DiveSettlePayload>
 export function registerHook (event: 'recontext', hook: DiveHook<DiveRecontextPayload>): () => void;
 export function registerHook (event: 'create', hook: DiveHook<DiveCreatePayload>): () => void;
 export function registerHook (event: DiveHookEvent, hook: (...args: never[]) => void): () => void {
-	const subscribers = hooks[event];
+	const subscribers = hooks[ event ];
 	// The public overloads narrow the payload per event; internally every
 	// subscriber is stored against the union and dispatched within its own try.
 	const stored = hook as DiveHook<DiveHookPayload>;
@@ -251,7 +277,7 @@ export function registerHook (event: DiveHookEvent, hook: (...args: never[]) => 
 }
 
 function detachHook (event: DiveHookEvent, hook: DiveHook<DiveHookPayload>): void {
-	const subscribers = hooks[event];
+	const subscribers = hooks[ event ];
 	const at = subscribers.indexOf(hook);
 	if (at !== -1) {
 		subscribers.splice(at, 1);
@@ -287,7 +313,7 @@ function dispatchHook (subscribers: Array<DiveHook<DiveHookPayload>>, payload: D
 	}
 }
 
-function emitEnter (edge: FlowEdge, args: unknown[]): void {
+function emitEnter (edge: Edge, args: unknown[]): void {
 	const subscribers = hooks.enter;
 	if (subscribers.length === 0) {
 		return;
@@ -296,7 +322,7 @@ function emitEnter (edge: FlowEdge, args: unknown[]): void {
 	dispatchHook(subscribers, payload);
 }
 
-function emitLeave (edge: FlowEdge, result: unknown): void {
+function emitLeave (edge: Edge, result: unknown): void {
 	const subscribers = hooks.leave;
 	if (subscribers.length === 0) {
 		return;
@@ -305,7 +331,7 @@ function emitLeave (edge: FlowEdge, result: unknown): void {
 	dispatchHook(subscribers, payload);
 }
 
-function emitSettle (edge: FlowEdge, result: unknown, error: unknown): void {
+function emitSettle (edge: Edge, result: unknown, error: unknown): void {
 	const subscribers = hooks.settle;
 	if (subscribers.length === 0) {
 		return;
@@ -315,8 +341,8 @@ function emitSettle (edge: FlowEdge, result: unknown, error: unknown): void {
 }
 
 function emitRecontext (
-	edge: FlowEdge,
-	fn: (...args: unknown[]) => unknown,
+	edge: Edge,
+	fn: AnyFn,
 	previousContext: object | undefined,
 	context: object | undefined
 ): void {
@@ -328,7 +354,7 @@ function emitRecontext (
 	dispatchHook(subscribers, payload);
 }
 
-function emitCreate (edge: FlowEdge, error: unknown): void {
+function emitCreate (edge: Edge, error: unknown): void {
 	const subscribers = hooks.create;
 	if (subscribers.length === 0) {
 		return;
@@ -348,15 +374,15 @@ function emitCreate (edge: FlowEdge, error: unknown): void {
 let latestEdges = new WeakMap<object, Edge>();
 let parents = new WeakMap<Edge, Edge>();
 let nextEdgeId = 1;
-// The running-edges store (design note: reports/running-edges-store-design.md):
-// the edge objects added at recordEdge and deleted at settle — the unfinished
-// fibers, i.e. the suspect set for uncaughtException attribution, queryable
+// The running-edges store: the edge objects added at recordEdge and
+// deleted at settle — the unfinished fibers, i.e. the suspect set for
+// uncaughtException attribution, queryable
 // in O(1) without walking parents. This is the
 // ONLY strong root dive owns: a running edge = incomplete flow = never
 // collectable. Skeletons only: the payload stays behind the edge's WeakRef
 // getter, so this set never pins user data. Invalidation is lifecycle-driven
 // (settle), never consumer-driven — an unconsumed store leaks nothing.
-const runningEdges = new Set<FlowEdge>();
+const runningEdges = new Set<Edge>();
 // Copy → the LIVE edge it was copied from, held weakly: copies returned by
 // getFlow()/getRunningEdges() resolve back to their live edge for edge.drop()
 // and flow walks — without copies pinning the trace (a strong link here
@@ -396,7 +422,8 @@ const edgeRegistry = new FinalizationRegistry((recordedIn: object) => {
 });
 
 function isObjectKey (value: unknown): value is object {
-	return value !== null && (typeof value === 'object' || typeof value === 'function');
+	const result = value !== null && (typeof value === 'object' || typeof value === 'function');
+	return result;
 }
 
 /**
@@ -404,8 +431,7 @@ function isObjectKey (value: unknown): value is object {
  * edges share one V8 hidden class (fast properties); `instance` is ONE
  * prototype getter over the private WeakRef — no per-edge closure.
  * A per-edge Object.defineProperty getter plus late instanceCollected
- * lands in V8 dictionary mode: a 448-byte property table
- * per edge (measured in /code/experiments/2026-09-24-otel-soak-unbounded/) —
+ * lands in V8 dictionary mode — a 448-byte property table per edge;
  * the declaration-order layout above is what keeps an edge at ~120 B.
  */
 class Edge implements FlowEdge {
@@ -492,7 +518,8 @@ class Edge implements FlowEdge {
 		}
 		const wanted = new Set<object>(targets.filter(isObjectKey));
 		if (wanted.size === 0) {
-			return; // only non-object args — ignored, and NOT a wipe
+			// only non-object args — ignored, and NOT a wipe
+			return;
 		}
 		let edge: Edge | undefined = start;
 		while (edge) {
@@ -544,7 +571,7 @@ class Edge implements FlowEdge {
  * resolve, the sync-return sites, recordCreation) so the store stays a
  * faithful index of status === 'running'.
  */
-function settleRunning (edge: FlowEdge): void {
+function settleRunning (edge: Edge): void {
 	runningEdges.delete(edge);
 }
 
@@ -583,7 +610,7 @@ function recordEdge (
 }
 
 /**
- * Parentage rule — the heart of the redesign.
+ * Parentage rule.
  *
  * Depth > 0: we are truly nested inside another wrapped invocation, so the
  * cursor IS the execution parent ("Y called X" is recorded truthfully).
@@ -617,13 +644,17 @@ function executionParent (context: object | undefined): Edge | null {
  * reading getFlow(error) later never depends on anything else still
  * holding the edge.
  */
-function pinError (error: unknown, edge: FlowEdge, instance: object | undefined): void {
+function pinError (error: unknown, edge: Edge, instance: object | undefined): void {
+	// The EDGE records the failure for ANY thrown value — a non-object throw
+	// still settles the edge, or it would stay 'running' forever (the running
+	// store is the one strong root: an unsettled edge is never collected)
+	edge.status = STATUS_ERROR;
+	settleRunning(edge);
+	// The pin needs a carrier — only objects can take the symbol properties
 	if (!isObjectKey(error)) {
 		return;
 	}
-	edge.status = STATUS_ERROR;
-	settleRunning(edge);
-	if (SymbolDiveEdge in (error as Record<symbol, unknown>)) {
+	if (SymbolDiveEdge in error) {
 		return;
 	}
 	Object.defineProperty(error, SymbolDiveEdge, {
@@ -658,7 +689,11 @@ export function enterContext (instance: object | undefined): void {
  * adapter-level wiring uses it to avoid double-wrapping constructor args.
  */
 export function isWrappedFunction (value: unknown): boolean {
-	return typeof value === 'function' && SymbolDiveWrapped in (value as unknown as Record<symbol, unknown>);
+	if (typeof value !== 'function') {
+		return false;
+	}
+	const result = SymbolDiveWrapped in value;
+	return result;
 }
 
 // V8 stack frame tail: "    at fn (file:line:col)" or "    at file:line:col"
@@ -678,8 +713,8 @@ function computeSelfPath (): string {
 	for (const line of lines) {
 		const match = line.match(CALLSITE_FRAME);
 		if (match) {
-			const selfPath = match[1].replace(/^file:\/\//, '');
-			return selfPath;
+			const matchedPath = match[ 1 ].replace(/^file:\/\//, '');
+			return matchedPath;
 		}
 	}
 	// No parseable frame: degrade to "skip nothing" rather than break wrap().
@@ -716,14 +751,14 @@ function captureCallsite (): string | undefined {
 		if (!match) {
 			continue;
 		}
-		const file = match[1].replace(/^file:\/\//, '');
+		const file = match[ 1 ].replace(/^file:\/\//, '');
 		if (file.startsWith('node:')) {
 			continue;
 		}
 		if (file === SELF_PATH || SELF_DIRS.some((dir) => file.startsWith(dir))) {
 			continue;
 		}
-		const result = `${file}:${match[2]}:${match[3]}`;
+		const result = `${file}:${match[ 2 ]}:${match[ 3 ]}`;
 		return result;
 	}
 	return undefined;
@@ -737,17 +772,18 @@ function captureCallsite (): string | undefined {
  *   no label             → fn.name, falling back to callsite, then 'anonymous'
  */
 function computeCaption (
-	fn: (...args: unknown[]) => unknown,
+	fn: AnyFn,
 	label: string | undefined,
 	callsite: string | undefined
 ): string {
-	const name = (fn as { name?: string }).name;
+	const name = fn.name || undefined;
 	if (label !== undefined) {
 		if (name) {
-			return `${label}:${name}`;
+			const labelled = `${label}:${name}`;
+			return labelled;
 		}
-		const result = callsite || ANONYMOUS;
-		return result;
+		const bare = callsite || ANONYMOUS;
+		return bare;
 	}
 	const result = name || callsite || ANONYMOUS;
 	return result;
@@ -768,7 +804,7 @@ function computeCaption (
  */
 function tapPromise (
 	result: Promise<unknown>,
-	edge: FlowEdge,
+	edge: Edge,
 	context: object | undefined,
 	started: number
 ): Promise<unknown> {
@@ -778,7 +814,7 @@ function tapPromise (
 		edge.duration = Date.now() - started;
 		let settled: unknown = resolved;
 		if (typeof resolved === 'function' && !isWrappedFunction(resolved)) {
-			const wrappedResult = wrapEntry(resolved as (...args: unknown[]) => unknown, context, true);
+			const wrappedResult = wrapEntry(resolved as WrappedFn, context, true);
 			settled = wrappedResult;
 		}
 		emitSettle(edge, settled, undefined);
@@ -812,16 +848,24 @@ function tapPromise (
  *     whole chain settles, resolved functions are wrapped, rejections pin
  *     the error to the call's edge
  */
-export function wrap<T extends (...args: unknown[]) => unknown> (
+export function wrap<T extends AnyFn> (
 	fn: T,
 	label?: string
 ): T;
-export function wrap<T extends (...args: unknown[]) => unknown> (
+export function wrap<T extends AnyFn> (
 	fn: T,
 	context?: object,
 	label?: string
 ): T;
-export function wrap<T extends (...args: unknown[]) => unknown> (
+// A class constructor is a supported wrap() target at runtime (the wrapper
+// builds it via Reflect.construct — kind 'construct'); typed so the class
+// comes back AS the class: `new Wrapped()` typechecks with no cast
+export function wrap<C extends abstract new (...args: never[]) => unknown> (
+	ctor: C,
+	contextOrLabel?: object | string,
+	label?: string
+): C;
+export function wrap<T extends AnyFn> (
 	fn: T,
 	contextOrLabel?: object | string,
 	label?: string
@@ -839,22 +883,27 @@ export function wrap<T extends (...args: unknown[]) => unknown> (
  * flow keeps its story when crossing another — re-rooting is the user's
  * explicit act, never a side effect of passing a function around.
  */
-function wrapEntry<T extends (...args: unknown[]) => unknown> (
+function wrapEntry<T extends AnyFn> (
 	fn: T,
 	context: object | undefined,
 	auto: boolean,
 	label?: string
 ): T {
 	if (!isWrappedFunction(fn)) {
-		const result = wrapInternal(fn, context, label);
-		return result;
+		const wrappedResult = wrapInternal(fn, context, label);
+		return wrappedResult;
 	}
 
 	if (auto) {
 		return fn;
 	}
 
-	const existing = (fn as unknown as Record<symbol, unknown>)[SymbolDiveContext] as object | undefined;
+	// The symbols are Symbol.for-registered (shared across the dual build),
+	// so they are `symbol`, never `unique symbol` — no interface can key
+	// them. Each read narrows through `in` + a value check instead of
+	// casting.
+	const storedContext: unknown = SymbolDiveContext in fn ? fn[ SymbolDiveContext ] : undefined;
+	const existing = typeof storedContext === 'object' && storedContext !== null ? storedContext : undefined;
 
 	// Explicit wrap with no context or the SAME context: idempotent.
 	if (context === undefined || context === existing) {
@@ -863,21 +912,29 @@ function wrapEntry<T extends (...args: unknown[]) => unknown> (
 
 	// Wrappers without origin info (constructor-arg holders, whose context
 	// is a mutable holder by design) cannot be re-rooted this way.
-	const original = (fn as unknown as Record<symbol, unknown>)[SymbolDiveOriginal] as T | undefined;
+	const storedOriginal: unknown = SymbolDiveOriginal in fn ? fn[ SymbolDiveOriginal ] : undefined;
+	// The wrap machinery only ever stores the ORIGINAL fn (a T) here —
+	// the typeof check is the runtime proof, the `as T` the generic
+	// re-grounding TS cannot derive
+	const original = typeof storedOriginal === 'function' ? storedOriginal as T : undefined;
 	if (original === undefined) {
 		return fn;
 	}
 
-	const rec = fn as unknown as Record<symbol, unknown>;
-	const caption = rec[SymbolDiveCaption] as string | undefined;
+	const storedCaption: unknown = SymbolDiveCaption in fn ? fn[ SymbolDiveCaption ] : undefined;
+	const caption = typeof storedCaption === 'string' ? storedCaption : undefined;
 	recordHandoff(original, existing, context, caption);
 	// The re-root preserves the ORIGINAL site's label/callsite: a bulb's
 	// identity is where it was first wrapped, not where it was re-rooted.
+	const storedLabel: unknown = SymbolDiveLabel in fn ? fn[ SymbolDiveLabel ] : undefined;
+	const originLabel = typeof storedLabel === 'string' ? storedLabel : undefined;
+	const storedCallsite: unknown = SymbolDiveCallsite in fn ? fn[ SymbolDiveCallsite ] : undefined;
+	const originCallsite = typeof storedCallsite === 'string' ? storedCallsite : undefined;
 	const result = wrapInternal(
 		original,
 		context,
-		label ?? rec[SymbolDiveLabel] as string | undefined,
-		rec[SymbolDiveCallsite] as string | undefined
+		label ?? originLabel,
+		originCallsite
 	);
 	return result;
 }
@@ -890,13 +947,13 @@ function wrapEntry<T extends (...args: unknown[]) => unknown> (
  * previous flow.
  */
 function recordHandoff (
-	fn: (...args: unknown[]) => unknown,
+	fn: AnyFn,
 	previousContext: object | undefined,
 	context: object | undefined,
 	caption?: string
 ): void {
 	const parent = isObjectKey(previousContext) ? latestEdges.get(previousContext) ?? null : null;
-	const name = caption || (fn as { name?: string }).name || ANONYMOUS;
+	const name = caption || fn.name || ANONYMOUS;
 	const edge = recordEdge(KIND_RECONTEXT, name, context, parent);
 	// The context arrives as an argument — attribution is never ambient here
 	if (isObjectKey(context)) {
@@ -906,11 +963,94 @@ function recordHandoff (
 }
 
 /**
+ * The per-invocation machinery shared by wrapInternal's wrapper and
+ * wrapInstanceMethods' wrappedMethod: save/restore cursor + context,
+ * record the edge, wrap the args (context propagates DOWN), invoke,
+ * propagate the context FORWARD (returned functions wrapped, promises
+ * tapped), pin errors, emit enter/leave, restore. What varies arrives as
+ * the spec: kind/name/context/callsite/source, the raw args, and `invoke`
+ * (the construct-vs-call step — new.target and `this` only exist in the
+ * caller's frame).
+ */
+interface WrappedInvocationSpec {
+	kind      : FlowKind;
+	name      : string;
+	context   : object | undefined;
+	// The wrap-time label/callsite, set on the edge when present (methods
+	// carry neither)
+	label     : string | undefined;
+	callsite  : string | undefined;
+	source    : InstanceSource;
+	args      : unknown[];
+	invoke    : (wrappedArgs: unknown[]) => unknown;
+}
+
+function runWrappedInvocation (spec: WrappedInvocationSpec): unknown {
+	const previousContext = lastContext;
+	const previousCursor = cursor;
+	lastContext = spec.context;
+
+	const edge = recordEdge(spec.kind, spec.name, spec.context, executionParent(spec.context));
+	if (spec.label !== undefined) {
+		edge.label = spec.label;
+	}
+	if (spec.callsite) {
+		edge.callsite = spec.callsite;
+	}
+	if (spec.context !== undefined) {
+		edge.instanceSource = spec.source;
+	}
+	cursor = edge;
+	emitEnter(edge, spec.args);
+	activeDepth++;
+
+	const started = edge.ts;
+	let produced: unknown;
+	try {
+		// Wrap function args with the captured context so context propagates
+		// DOWN through nested callbacks (args of args). Because each wrapped
+		// arg is itself a wrapped function that does this too, the propagation
+		// chains to any depth. Already-wrapped args are left as-is.
+		const wrappedArgs = wrapArgs(spec.args, spec.context);
+
+		let result: unknown = spec.invoke(wrappedArgs);
+
+		// Wrap returned functions so they carry the context forward
+		if (typeof result === 'function' && !isWrappedFunction(result)) {
+			result = wrapEntry(result as WrappedFn, spec.context, true);
+		}
+
+		// If Promise: tap it — the edge closes ('ok' + full-lifetime
+		// duration) when the whole chain settles; resolved functions are
+		// wrapped to carry context forward; rejections pin to this edge.
+		if (result instanceof Promise) {
+			const promiseResult = tapPromise(result, edge, spec.context, started);
+			produced = promiseResult;
+			return promiseResult;
+		}
+
+		edge.status = STATUS_OK;
+		settleRunning(edge);
+		produced = result;
+		return result;
+	} catch (error: unknown) {
+		pinError(error, edge, spec.context);
+		throw error;
+	} finally {
+		edge.duration = Date.now() - started;
+		emitLeave(edge, produced);
+		cursor = previousCursor;
+		activeDepth--;
+		lastContext = previousContext;
+	}
+}
+
+/**
  * The actual wrapper construction behind wrapEntry: capture the context,
  * record each invocation as an edge, propagate context through args,
  * returned functions and promise chains, pin errors to the edge.
  */
-function wrapInternal<T extends (...args: unknown[]) => unknown> (
+function wrapInternal<T extends AnyFn> (
 	fn: T,
 	context: object | undefined,
 	label?: string,
@@ -919,84 +1059,35 @@ function wrapInternal<T extends (...args: unknown[]) => unknown> (
 	const capturedContext = context ?? lastContext;
 	// Provenance, decided at wrap time: an explicitly passed context is trusted;
 	// the lastContext fallback is newest-wins ambient — truthful only for
-	// fully-instrumented synchronous flows (see reports/lastcontext-ambiguity.md)
+	// fully-instrumented synchronous flows
 	const capturedSource: InstanceSource = context !== undefined ? 'explicit' : 'ambient';
 	const callsite = callsiteOverride ?? captureCallsite();
 	const caption = computeCaption(fn, label, callsite);
 
-	const wrapped = function (this: unknown, ...args: unknown[]) {
+	const wrapped = function (this: unknown, ...args: never[]) {
 		const isConstructor = new.target !== undefined;
-		const previousContext = lastContext;
-		const previousCursor = cursor;
-		lastContext = capturedContext;
-
-		const edge = recordEdge(
-			isConstructor ? KIND_CONSTRUCT : KIND_CALL,
-			caption,
-			capturedContext,
-			executionParent(capturedContext)
-		);
-		if (label !== undefined) {
-			edge.label = label;
-		}
-		if (callsite !== undefined) {
-			edge.callsite = callsite;
-		}
-		if (capturedContext !== undefined) {
-			edge.instanceSource = capturedSource;
-		}
-		cursor = edge;
-		emitEnter(edge, args);
-		activeDepth++;
-
-		const started = edge.ts;
-		let produced: unknown;
-		try {
-			// Wrap function args with the captured context so context propagates
-			// DOWN through nested callbacks (args of args). Because each wrapped
-			// arg is itself a wrapped function that does this too, the propagation
-			// chains to any depth. Already-wrapped args are left as-is.
-			const wrappedArgs = wrapArgs(args, capturedContext);
-
-			let result: unknown;
-			if (isConstructor) {
-				result = Reflect.construct(
-					fn as unknown as new (...args: unknown[]) => unknown,
-					wrappedArgs,
-					new.target
-				);
-			} else {
-				result = fn.apply(this, wrappedArgs);
-			}
-
-			// Wrap returned functions so they carry the context forward
-			if (typeof result === 'function' && !isWrappedFunction(result)) {
-				result = wrapEntry(result as (...args: unknown[]) => unknown, capturedContext, true);
-			}
-
-			// If Promise: tap it — the edge closes ('ok' + full-lifetime
-			// duration) when the whole chain settles; resolved functions are
-			// wrapped to carry context forward; rejections pin to this edge.
-			if (result instanceof Promise) {
-				const promiseResult = tapPromise(result, edge, capturedContext, started);
-				produced = promiseResult;
-				return promiseResult;
-			}
-
-			edge.status = STATUS_OK;
-			settleRunning(edge);
-			produced = result;
-			return result;
-		} catch (error: unknown) {
-			pinError(error, edge, capturedContext);
-			throw error;
-		} finally {
-			edge.duration = Date.now() - started;
-			emitLeave(edge, produced);
-			cursor = previousCursor;
-			activeDepth--;
-			lastContext = previousContext;
-		}
+		const produced = runWrappedInvocation({
+			kind    : isConstructor ? KIND_CONSTRUCT : KIND_CALL,
+			name    : caption,
+			context : capturedContext,
+			label,
+			callsite,
+			source  : capturedSource,
+			args,
+			// new.target and `this` are this frame's — the construct/call
+			// step cannot leave it
+			invoke  : (wrappedArgs: unknown[]): unknown => {
+				if (isConstructor) {
+					// AnyFn is assignable to Reflect.construct's Function
+					// target — no cast; the runtime fn IS constructible here
+					const constructed: unknown = Reflect.construct(fn, wrappedArgs, new.target);
+					return constructed;
+				}
+				const called: unknown = Reflect.apply(fn, this, wrappedArgs);
+				return called;
+			},
+		});
+		return produced;
 	} as T;
 
 	// Preserve prototype for constructor wrapping
@@ -1057,13 +1148,14 @@ function wrapArgs (
 	args: unknown[],
 	context?: object
 ): unknown[] {
-	return args.map((arg) => {
+	const result = args.map((arg) => {
 		if (typeof arg === 'function') {
-			const result = wrapEntry(arg as (...args: unknown[]) => unknown, context, true);
-			return result;
+			const wrappedArg = wrapEntry(arg as WrappedFn, context, true);
+			return wrappedArg;
 		}
 		return arg;
 	});
+	return result;
 }
 
 /**
@@ -1082,9 +1174,9 @@ function wrapArgs (
  * each time.
  */
 export function wrapConstructorArg (
-	fn: (...args: unknown[]) => unknown,
+	fn: AnyFn,
 	context: object | undefined
-): (...args: unknown[]) => unknown {
+): AnyFn {
 	const holder: DiveArgHolder = {
 		context,
 		used : false,
@@ -1093,15 +1185,16 @@ export function wrapConstructorArg (
 	const wrapped = function (this: unknown, ...args: unknown[]) {
 		holder.used = true;
 		const wrappedCall = wrapEntry(fn, holder.context, true);
-		const result = wrappedCall.apply(this, args);
+		// Reflect.apply's return is `any` in the lib types — pin it to unknown
+		const result: unknown = Reflect.apply(wrappedCall, this, args);
 		return result;
-	} as (...args: unknown[]) => unknown;
+	};
 
 	Object.defineProperty(wrapped, SymbolDiveWrapped, {
-		value: true, configurable: false, enumerable: false,
+		value : true, configurable : false, enumerable : false,
 	});
 	Object.defineProperty(wrapped, SymbolDiveArgHolder, {
-		value: holder, configurable: false, enumerable: false,
+		value : holder, configurable : false, enumerable : false,
 	});
 
 	return wrapped;
@@ -1116,7 +1209,8 @@ export function upgradeConstructorArg (arg: unknown, instance: object): void {
 	if (typeof arg !== 'function') {
 		return;
 	}
-	const holder = (arg as unknown as Record<symbol, unknown>)[SymbolDiveArgHolder] as DiveArgHolder | undefined;
+	const storedHolder: unknown = SymbolDiveArgHolder in arg ? arg[ SymbolDiveArgHolder ] : undefined;
+	const holder = isDiveArgHolder(storedHolder) ? storedHolder : undefined;
 	if (holder && !holder.used) {
 		holder.context = instance;
 	}
@@ -1133,7 +1227,7 @@ export function upgradeConstructorArg (arg: unknown, instance: object): void {
  * instead of once per instance. NOTE: mnemonica gives every instance its own
  * immediate prototype, so for mnemonica instances this is still per-instance
  * (no shared prototype exists to wrap once); it is not worse, just not a win.
- * See README "Internals".
+ * See AGENTS.md "Internals".
  *
  * Wrapped methods also:
  *   - wrap function arguments to propagate context
@@ -1148,7 +1242,7 @@ export function wrapInstanceMethods (instance: object): void {
 
 	const descriptors = Object.getOwnPropertyDescriptors(proto);
 
-	for (const [name, descriptor] of Object.entries(descriptors)) {
+	for (const [ name, descriptor ] of Object.entries(descriptors)) {
 		if (name === 'constructor') {
 			continue;
 		}
@@ -1163,51 +1257,25 @@ export function wrapInstanceMethods (instance: object): void {
 			continue;
 		}
 
-		const fn = descriptor.value as (...args: unknown[]) => unknown;
+		const fn = descriptor.value as WrappedFn;
 
 		const wrappedMethod = function (this: object, ...args: unknown[]) {
 			const context = this;
-			const previousContext = lastContext;
-			const previousCursor = cursor;
-			lastContext = context;
-
-			const edge = recordEdge(KIND_METHOD, name, context, executionParent(context));
-			// The receiver IS the context — never ambient
-			edge.instanceSource = 'explicit';
-			cursor = edge;
-			emitEnter(edge, args);
-			activeDepth++;
-
-			const started = edge.ts;
-			let produced: unknown;
-			try {
-				const wrappedArgs = wrapArgs(args, context);
-				let result = fn.apply(this, wrappedArgs);
-
-				if (typeof result === 'function' && !isWrappedFunction(result)) {
-					result = wrapEntry(result as (...args: unknown[]) => unknown, context, true);
-				}
-
-				if (result instanceof Promise) {
-					const promiseResult = tapPromise(result, edge, context, started);
-					produced = promiseResult;
-					return promiseResult;
-				}
-
-				edge.status = STATUS_OK;
-				settleRunning(edge);
-				produced = result;
-				return result;
-			} catch (error: unknown) {
-				pinError(error, edge, context);
-				throw error;
-			} finally {
-				edge.duration = Date.now() - started;
-				emitLeave(edge, produced);
-				cursor = previousCursor;
-				activeDepth--;
-				lastContext = previousContext;
-			}
+			const produced = runWrappedInvocation({
+				kind     : KIND_METHOD,
+				name,
+				context,
+				label    : undefined,
+				callsite : undefined,
+				// The receiver IS the context — never ambient
+				source   : 'explicit',
+				args,
+				invoke   : (wrappedArgs: unknown[]): unknown => {
+					const called: unknown = fn.apply(this, wrappedArgs);
+					return called;
+				},
+			});
+			return produced;
 		};
 
 		// Mark so a shared prototype is not re-wrapped by the next instance.
@@ -1240,8 +1308,8 @@ export function wrapInstanceMethods (instance: object): void {
 // else — only when truly nested — the execution cursor.
 function creationParent (parent: object | undefined): Edge | null {
 	if (isObjectKey(parent)) {
-		const result = latestEdges.get(parent) ?? null;
-		return result;
+		const parentEdge = latestEdges.get(parent) ?? null;
+		return parentEdge;
 	}
 	const result = activeDepth > 0 ? cursor : null;
 	return result;
@@ -1286,8 +1354,10 @@ export function recordCreationError (name: string, errored: unknown, parent?: ob
 		// pinned; same opt-in 'create' event as recordCreation.
 		emitCreate(edge, errored);
 	}
-	if (errored) {
-		enterContext(errored as object);
+	if (isObjectKey(errored)) {
+		// Only an object can carry the context — a thrown string/number
+		// must not become current()
+		enterContext(errored);
 	} else if (parent) {
 		enterContext(parent);
 	}
@@ -1318,9 +1388,12 @@ export function getFlow (target?: unknown): FlowEdge[] {
 	const branch: FlowEdge[] = [];
 	let edge = flowStart(target);
 	while (edge) {
-		branch.unshift(copyEdge(edge));
+		// push in walk order (newest first), one reverse at the end —
+		// unshift moved the whole array each step (quadratic on long chains)
+		branch.push(copyEdge(edge));
 		edge = parents.get(edge);
 	}
+	branch.reverse();
 	return branch;
 }
 
@@ -1344,8 +1417,8 @@ export function chainDepth (target?: unknown): number {
 function flowStart (target: unknown): Edge | undefined {
 	if (target instanceof Edge) {
 		const source = copySource.get(target);
-		const result = source ? source.deref() : target;
-		return result === undefined ? undefined : result;
+		const resolved = source ? source.deref() : target;
+		return resolved;
 	}
 	if (target instanceof Error) {
 		const pinned = pinnedEdge(target);
@@ -1362,7 +1435,7 @@ function flowStart (target: unknown): Edge | undefined {
 
 // The edge object pinError put on an error (undefined when none).
 function pinnedEdge (error: object): Edge | undefined {
-	const pinned = (error as Record<symbol, unknown>)[SymbolDiveEdge];
+	const pinned: unknown = SymbolDiveEdge in error ? error[ SymbolDiveEdge ] : undefined;
 	const result = pinned instanceof Edge ? pinned : undefined;
 	return result;
 }
@@ -1370,12 +1443,13 @@ function pinnedEdge (error: object): Edge | undefined {
 /**
  * Copy an edge for the public accessors. The instance lives behind the
  * WeakRef getter — a naive spread would READ it at copy time and pin the
- * instance on the copy (the first weak-refs test run failed exactly this
- * way). Edge.copy() shares the WeakRef instead. Every recorded edge is an
- * Edge; the spread branch only narrows the declared FlowEdge type.
+ * instance on the copy. Edge.copy() shares the WeakRef instead. Every
+ * recorded edge is an Edge — the stores are typed so (runningEdges:
+ * Set<Edge>, parents WeakMap<Edge, Edge>), and the param is Edge, never
+ * the public interface.
  */
-function copyEdge (edge: FlowEdge): FlowEdge {
-	const result = edge instanceof Edge ? edge.copy() : { ...edge };
+function copyEdge (edge: Edge): FlowEdge {
+	const result = edge.copy();
 	return result;
 }
 
@@ -1383,22 +1457,23 @@ function copyEdge (edge: FlowEdge): FlowEdge {
  * The edges still running right now — the unfinished fibers, i.e. the
  * suspect set for uncaughtException/unhandledRejection attribution,
  * without walking parents. Copies, same semantics as getFlow.
- * See reports/running-edges-store-design.md.
  */
 export function getRunningEdges (): FlowEdge[] {
-	const result = [...runningEdges.values()].map((edge) => copyEdge(edge));
+	const result = [ ...runningEdges.values() ].map((edge) => copyEdge(edge));
 	return result;
 }
 
 /**
  * The data pinned to an error. Prefers the instance pinned at the failure
  * site; falls back to the instance of the error's trace edge.
+ * Accepts anything (unknown, like getFlow) — non-objects pin nothing.
  */
-export function getErrorInstance (error: Error): object | undefined {
+export function getErrorInstance (error: unknown): object | undefined {
 	if (!isObjectKey(error)) {
 		return undefined;
 	}
-	const pinned = (error as unknown as Record<symbol, unknown>)[SymbolDiveInstance] as object | undefined;
+	const storedPin: unknown = SymbolDiveInstance in error ? error[ SymbolDiveInstance ] : undefined;
+	const pinned = typeof storedPin === 'object' && storedPin !== null ? storedPin : undefined;
 	if (pinned !== undefined) {
 		return pinned;
 	}

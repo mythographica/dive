@@ -63,7 +63,7 @@ describe('step 3 — an Error holds its edge object', () => {
 		});
 		const flow = getFlow(caught);
 		expect(flow.length).toBeGreaterThan(0);
-		const failing = flow[flow.length - 1];
+		const failing = flow[ flow.length - 1 ];
 		expect(failing.kind).toBe('call');
 		expect(failing.status).toBe('error');
 		expect(getErrorInstance(caught)).toEqual({ request : 1 });

@@ -47,7 +47,7 @@ describe('build-cjs (F12)', () => {
 			'isWrappedFunction',
 		];
 		for (const name of fns) {
-			expect(typeof cjs[name], name).toBe('function');
+			expect(typeof cjs[ name ], name).toBe('function');
 		}
 	});
 
@@ -56,8 +56,8 @@ describe('build-cjs (F12)', () => {
 		const before = cjs.stats.recorded;
 		const ctx = {};
 		const wrapped = cjs.wrap(function probe () {
-			const result = 42;
-			return result;
+			const probeResult = 42;
+			return probeResult;
 		}, ctx);
 		const result = wrapped();
 		expect(result).toBe(42);

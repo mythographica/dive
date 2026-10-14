@@ -21,6 +21,7 @@ import {
 	registerHook,
 	unregisterHook,
 	clear,
+	current,
 	recordCreation,
 	recordCreationError,
 	type DiveEnterPayload,
@@ -31,7 +32,7 @@ import {
 	type FlowEdge,
 } from '../src/index.js';
 
-const context = { name: 'ctx' };
+const context = { name : 'ctx' };
 
 describe('registerHook: enter', () => {
 	beforeEach(() => clear());
@@ -43,17 +44,18 @@ describe('registerHook: enter', () => {
 		});
 
 		function fn (this: unknown, a: number, b: string) {
-			return a + b.length;
+			const sum = a + b.length;
+			return sum;
 		}
 		const wrapped = wrap(fn, context);
 		const result = wrapped(2, 'abc');
 
 		expect(result).toBe(5);
 		expect(seen.length).toBe(1);
-		expect(seen[0].edge.name).toBe('fn');
-		expect(seen[0].edge.kind).toBe('call');
-		expect(seen[0].edge.instance).toBe(context);
-		expect(seen[0].args).toEqual([2, 'abc']);
+		expect(seen[ 0 ].edge.name).toBe('fn');
+		expect(seen[ 0 ].edge.kind).toBe('call');
+		expect(seen[ 0 ].edge.instance).toBe(context);
+		expect(seen[ 0 ].args).toEqual([ 2, 'abc' ]);
 	});
 
 	it('the enter edge is the SAME object the leave hook later sees', () => {
@@ -79,10 +81,12 @@ describe('registerHook: enter', () => {
 		const spanId = Symbol('span');
 		let attached: unknown;
 		registerHook('enter', ({ edge }) => {
-			(edge as unknown as Record<symbol, unknown>)[spanId] = 'span-1';
+			Object.assign(edge, { [ spanId ] : 'span-1' });
 		});
 		registerHook('leave', ({ edge }) => {
-			attached = (edge as unknown as Record<symbol, unknown>)[spanId];
+			if (spanId in edge) {
+				attached = edge[ spanId ];
+			}
 		});
 
 		const wrapped = wrap(function fn () {
@@ -103,10 +107,10 @@ describe('registerHook: enter', () => {
 			this.v = v;
 		}
 		const Wrapped = wrap(Thing, context);
-		const instance = Reflect.construct(Wrapped, [42]);
+		const instance = Reflect.construct(Wrapped, [ 42 ]);
 
 		expect(instance.v).toBe(42);
-		expect(kinds).toEqual(['construct']);
+		expect(kinds).toEqual([ 'construct' ]);
 	});
 });
 
@@ -125,9 +129,9 @@ describe('registerHook: leave', () => {
 		wrapped();
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].result).toBe('plain');
-		expect(seen[0].edge.status).toBe('ok');
-		expect(typeof seen[0].edge.duration).toBe('number');
+		expect(seen[ 0 ].result).toBe('plain');
+		expect(seen[ 0 ].edge.status).toBe('ok');
+		expect(typeof seen[ 0 ].edge.duration).toBe('number');
 	});
 
 	it('carries the tapped promise when the result is async', () => {
@@ -142,7 +146,7 @@ describe('registerHook: leave', () => {
 		wrapped();
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].result instanceof Promise).toBe(true);
+		expect(seen[ 0 ].result instanceof Promise).toBe(true);
 	});
 
 	it('sees an error status and undefined result when the call throws', () => {
@@ -157,8 +161,8 @@ describe('registerHook: leave', () => {
 		expect(() => wrapped()).toThrow('boom');
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].result).toBe(undefined);
-		expect(seen[0].edge.status).toBe('error');
+		expect(seen[ 0 ].result).toBe(undefined);
+		expect(seen[ 0 ].edge.status).toBe('error');
 	});
 });
 
@@ -178,8 +182,8 @@ describe('registerHook: settle', () => {
 
 		expect(result).toBe('done');
 		expect(seen.length).toBe(1);
-		expect(seen[0].result).toBe('done');
-		expect(seen[0].error).toBe(undefined);
+		expect(seen[ 0 ].result).toBe('done');
+		expect(seen[ 0 ].error).toBe(undefined);
 	});
 
 	it('a resolved function is settled in its wrapped form', async () => {
@@ -194,11 +198,17 @@ describe('registerHook: settle', () => {
 			};
 			return inner;
 		}, context);
-		const resolved = await wrapped() as unknown as () => number;
+		const resolved: unknown = await wrapped();
+		if (typeof resolved !== 'function') {
+			throw new Error('expected the promise to resolve to a function');
+		}
+		// resolved is proven a function; the wrap contract makes it the
+		// zero-arg number producer — the one plain `as` for the call
+		const resolvedFn = resolved as () => number;
 
-		expect(resolved()).toBe(7);
+		expect(resolvedFn()).toBe(7);
 		expect(seen.length).toBe(1);
-		expect(seen[0].result).toBe(resolved);
+		expect(seen[ 0 ].result).toBe(resolved);
 	});
 
 	it('fires with the error when the chain rejects', async () => {
@@ -214,8 +224,8 @@ describe('registerHook: settle', () => {
 		await expect(wrapped()).rejects.toThrow('async boom');
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].error).toBe(failure);
-		expect(seen[0].result).toBe(undefined);
+		expect(seen[ 0 ].error).toBe(failure);
+		expect(seen[ 0 ].result).toBe(undefined);
 	});
 
 	it('leave and settle are DISTINCT moments: sync head first, work done later', async () => {
@@ -233,7 +243,7 @@ describe('registerHook: settle', () => {
 		}, context);
 		await wrapped();
 
-		expect(order).toEqual(['leave', 'settle']);
+		expect(order).toEqual([ 'leave', 'settle' ]);
 	});
 });
 
@@ -246,7 +256,7 @@ describe('registerHook: recontext', () => {
 			seen.push(payload);
 		});
 
-		const other = { name: 'other' };
+		const other = { name : 'other' };
 		function fn () {
 			return 1;
 		}
@@ -255,10 +265,10 @@ describe('registerHook: recontext', () => {
 
 		expect(second).not.toBe(first);
 		expect(seen.length).toBe(1);
-		expect(seen[0].edge.kind).toBe('recontext');
-		expect(seen[0].previousContext).toBe(context);
-		expect(seen[0].context).toBe(other);
-		expect(seen[0].fn).toBe(fn);
+		expect(seen[ 0 ].edge.kind).toBe('recontext');
+		expect(seen[ 0 ].previousContext).toBe(context);
+		expect(seen[ 0 ].context).toBe(other);
+		expect(seen[ 0 ].fn).toBe(fn);
 	});
 
 	it('does NOT fire for an idempotent re-wrap (no/same context)', () => {
@@ -295,7 +305,7 @@ describe('registerHook: containment and lifecycle', () => {
 		const result = wrapped();
 
 		expect(result).toBe('untouched');
-		expect(healthy).toEqual(['fn']);
+		expect(healthy).toEqual([ 'fn' ]);
 	});
 
 	it('a throwing settle subscriber never swallows the rejection', async () => {
@@ -375,16 +385,16 @@ describe('registerHook: create (opt-in construction edges)', () => {
 			seen.push(payload);
 		});
 
-		const instance = { name: 'inst' };
+		const instance = { name : 'inst' };
 		recordCreation('MyType', instance);
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].edge.name).toBe('MyType');
-		expect(seen[0].edge.kind).toBe('create');
-		expect(seen[0].edge.status).toBe('ok');
-		expect(seen[0].edge.duration).toBe(0);
-		expect(seen[0].edge.instance).toBe(instance);
-		expect(seen[0].error).toBeUndefined();
+		expect(seen[ 0 ].edge.name).toBe('MyType');
+		expect(seen[ 0 ].edge.kind).toBe('create');
+		expect(seen[ 0 ].edge.status).toBe('ok');
+		expect(seen[ 0 ].edge.duration).toBe(0);
+		expect(seen[ 0 ].edge.instance).toBe(instance);
+		expect(seen[ 0 ].error).toBeUndefined();
 	});
 
 	it('carries the data-flow parentage of the construction', () => {
@@ -393,13 +403,13 @@ describe('registerHook: create (opt-in construction edges)', () => {
 			seen.push(payload);
 		});
 
-		const parentInst = { name: 'parent' };
-		const childInst = { name: 'child' };
+		const parentInst = { name : 'parent' };
+		const childInst = { name : 'child' };
 		recordCreation('Parent', parentInst);
 		recordCreation('Child', childInst, parentInst);
 
 		expect(seen.length).toBe(2);
-		expect(seen[1].edge.parentId).toBe(seen[0].edge.id);
+		expect(seen[ 1 ].edge.parentId).toBe(seen[ 0 ].edge.id);
 	});
 
 	it('does NOT fire as enter — the adapter owns the construction domain', () => {
@@ -408,7 +418,7 @@ describe('registerHook: create (opt-in construction edges)', () => {
 			entered++;
 		});
 
-		recordCreation('MyType', { name: 'inst' });
+		recordCreation('MyType', { name : 'inst' });
 
 		expect(entered).toBe(0);
 	});
@@ -423,10 +433,22 @@ describe('registerHook: create (opt-in construction edges)', () => {
 		recordCreationError('BrokenType', failure);
 
 		expect(seen.length).toBe(1);
-		expect(seen[0].edge.name).toBe('BrokenType');
-		expect(seen[0].edge.kind).toBe('create');
-		expect(seen[0].edge.status).toBe('error');
-		expect(seen[0].error).toBe(failure);
+		expect(seen[ 0 ].edge.name).toBe('BrokenType');
+		expect(seen[ 0 ].edge.kind).toBe('create');
+		expect(seen[ 0 ].edge.status).toBe('error');
+		expect(seen[ 0 ].error).toBe(failure);
+	});
+
+	it('a non-object "error" never becomes the current context', () => {
+		// A thrown string/number is truthy but cannot carry the context —
+		// recordCreationError must not switch current() to it
+		const marker = { name : 'still-current' };
+		recordCreation('Marker', marker);
+		recordCreationError('BrokenType', 'a thrown string');
+		expect(current()).toBe(marker);
+		// and no edge records a non-object failure at all
+		recordCreationError('BrokenToo', 42);
+		expect(current()).toBe(marker);
 	});
 
 	it('the returned unregister function detaches the subscriber', () => {
@@ -435,9 +457,9 @@ describe('registerHook: create (opt-in construction edges)', () => {
 			fired++;
 		});
 
-		recordCreation('MyType', { name: 'a' });
+		recordCreation('MyType', { name : 'a' });
 		unregister();
-		recordCreation('MyType', { name: 'b' });
+		recordCreation('MyType', { name : 'b' });
 
 		expect(fired).toBe(1);
 	});
@@ -449,7 +471,7 @@ describe('registerHook: create (opt-in construction edges)', () => {
 		});
 
 		clear();
-		recordCreation('MyType', { name: 'inst' });
+		recordCreation('MyType', { name : 'inst' });
 
 		expect(fired).toBe(0);
 	});

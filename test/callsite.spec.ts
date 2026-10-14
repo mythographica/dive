@@ -19,8 +19,8 @@ import {
 	wrap,
 	clear,
 	registerHook,
+	type FlowEdge,
 } from '../src/index.js';
-import type { FlowEdge } from '../src/index.js';
 
 const SymbolDiveCallsite = Symbol.for('mnemonica.dive.callsite');
 
@@ -46,8 +46,8 @@ describe('bulb identity: caption cascade', () => {
 		const wrapped = wrap(namedWork);
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].name).toBe('namedWork');
-		expect(seen[0].label).toBeUndefined();
+		expect(seen[ 0 ].name).toBe('namedWork');
+		expect(seen[ 0 ].label).toBeUndefined();
 	});
 
 	it('prefixes the name with the label when both are given', () => {
@@ -57,8 +57,8 @@ describe('bulb identity: caption cascade', () => {
 		const wrapped = wrap(namedWork, 'guard');
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].name).toBe('guard:namedWork');
-		expect(seen[0].label).toBe('guard');
+		expect(seen[ 0 ].name).toBe('guard:namedWork');
+		expect(seen[ 0 ].label).toBe('guard');
 	});
 
 	it('accepts a label after an explicit context', () => {
@@ -69,8 +69,8 @@ describe('bulb identity: caption cascade', () => {
 		const wrapped = wrap(namedWork, context, 'guard');
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].name).toBe('guard:namedWork');
-		expect(seen[0].label).toBe('guard');
+		expect(seen[ 0 ].name).toBe('guard:namedWork');
+		expect(seen[ 0 ].label).toBe('guard');
 	});
 
 	it('falls back to the callsite for an anonymous function with a label', () => {
@@ -79,17 +79,17 @@ describe('bulb identity: caption cascade', () => {
 		}, 'guard');
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].name).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
-		expect(seen[0].label).toBe('guard');
-		expect(seen[0].callsite).toBe(seen[0].name);
+		expect(seen[ 0 ].name).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
+		expect(seen[ 0 ].label).toBe('guard');
+		expect(seen[ 0 ].callsite).toBe(seen[ 0 ].name);
 	});
 
 	it('falls back to the callsite for an anonymous function without a label', () => {
 		const wrapped = wrap(() => 1);
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].name).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
-		expect(seen[0].label).toBeUndefined();
+		expect(seen[ 0 ].name).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
+		expect(seen[ 0 ].label).toBeUndefined();
 	});
 });
 
@@ -105,19 +105,22 @@ describe('bulb identity: callsite capture', () => {
 		const wrapped = wrap(namedWork);
 		const seen = collectEdges();
 		wrapped();
-		expect(seen[0].callsite).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
-		expect(seen[0].callsite).not.toContain('dive/src');
-		expect(seen[0].callsite).not.toContain('dive/build');
+		expect(seen[ 0 ].callsite).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
+		expect(seen[ 0 ].callsite).not.toContain('dive/src');
+		expect(seen[ 0 ].callsite).not.toContain('dive/build');
 	});
 
 	it('gives auto-wrapped returned functions a callsite identity', () => {
 		const seen = collectEdges();
 		const factory = wrap(function factory () {
-			return () => 42;
+			// named-const assignment would infer a function name and change the
+			// caption; the IIFE keeps the returned arrow anonymous
+			const arrow = (() => () => 42)();
+			return arrow;
 		});
 		const produced = factory();
 		produced();
-		const producedEdge = seen[seen.length - 1];
+		const producedEdge = seen[ seen.length - 1 ];
 		expect(producedEdge.callsite).toMatch(/callsite\.spec\.ts:\d+:\d+$/);
 		// the returned arrow is anonymous: its caption IS the callsite
 		expect(producedEdge.name).toBe(producedEdge.callsite);
@@ -131,8 +134,8 @@ describe('bulb identity: callsite capture', () => {
 		const ctxB = {};
 		const wrapped = wrap(namedWork, ctxA);
 		const rerooted = wrap(wrapped, ctxB);
-		const first = (wrapped as unknown as Record<symbol, unknown>)[SymbolDiveCallsite];
-		const second = (rerooted as unknown as Record<symbol, unknown>)[SymbolDiveCallsite];
+		const first = SymbolDiveCallsite in wrapped ? wrapped[ SymbolDiveCallsite ] : undefined;
+		const second = SymbolDiveCallsite in rerooted ? rerooted[ SymbolDiveCallsite ] : undefined;
 		expect(second).toBe(first);
 	});
 });
@@ -145,7 +148,7 @@ describe('callsite under --enable-source-maps (child process on build/)', () => 
 		const childScript = path.join(here, 'fixtures', 'callsite-mapped-child.mjs');
 		const out = execFileSync(
 			process.execPath,
-			['--enable-source-maps', childScript],
+			[ '--enable-source-maps', childScript ],
 			{ encoding : 'utf8' },
 		);
 		const { name } = JSON.parse(out) as { name : string };

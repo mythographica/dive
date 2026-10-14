@@ -9,6 +9,37 @@ import { createTypesCollection, getProps } from 'mnemonica/module';
 import { current, clear } from '../src/index.js';
 import { attachHooks } from './helpers/attach-hooks.js';
 
+interface ContextSnapshot {
+	hasType      : boolean;
+	typeName     : string | undefined;
+	hasParent    : boolean;
+	hasArgs      : boolean;
+	hasTimestamp : boolean;
+}
+
+interface UserCtxShape {
+	name  : string;
+	email : string;
+	role  : string | undefined;
+}
+
+interface FullContextSnapshot {
+	name         : string | undefined;
+	email        : string | undefined;
+	role         : string | undefined;
+	typeName     : string | undefined;
+	parentName   : string | undefined;
+	args         : unknown;
+	hasTimestamp : boolean;
+}
+
+// One guard for the whole file: the value current() returns has the
+// userland shape (or is absent) — narrow once, then plain access
+const isUserCtx = function (value: unknown): value is UserCtxShape {
+	const matches = typeof value === 'object' && value !== null && 'name' in value && 'email' in value;
+	return matches;
+};
+
 describe('lastContext IS the instance', () => {
 	beforeEach(() => clear());
 
@@ -27,9 +58,10 @@ describe('lastContext IS the instance', () => {
 		const ctx = current();
 		expect(ctx).toBe(instance);
 
-		// They should be the same reference
-		expect((ctx as any).id).toBe('test');
-		expect((ctx as any).value).toBe(42);
+		// ctx IS instance (asserted above) — read through the typed
+		// reference, no cast
+		expect(instance.id).toBe('test');
+		expect(instance.value).toBe(42);
 	});
 
 	it('getProps works on the context returned by current()', () => {
@@ -38,7 +70,7 @@ describe('lastContext IS the instance', () => {
 		// Define type with method BEFORE attaching hooks
 		const Parent = collection.define('ParentCtx', function (this: {
 			kind: string;
-			readContext: () => any;
+			readContext: () => ContextSnapshot | null;
 		}) {
 			this.kind = 'parent';
 
@@ -47,13 +79,14 @@ describe('lastContext IS the instance', () => {
 				const ctx = current();
 				if (ctx) {
 					const props = getProps(ctx);
-					return {
-						hasType     : !!props?.__type__,
-						typeName    : props?.__type__?.TypeName,
-						hasParent   : !!props?.__parent__,
-						hasArgs     : !!props?.__args__,
-						hasTimestamp: !!props?.__timestamp__,
+					const snapshot: ContextSnapshot = {
+						hasType      : !!props?.__type__,
+						typeName     : props?.__type__?.TypeName,
+						hasParent    : !!props?.__parent__,
+						hasArgs      : !!props?.__args__,
+						hasTimestamp : !!props?.__timestamp__,
 					};
+					return snapshot;
 				}
 				return null;
 			};
@@ -67,8 +100,8 @@ describe('lastContext IS the instance', () => {
 
 		const result = parent.readContext();
 
-
 		expect(result).not.toBeNull();
+		if (result === null) { return; }
 		expect(result.hasType).toBe(true);
 		expect(result.typeName).toBe('ParentCtx');
 		expect(result.hasArgs).toBe(true);
@@ -81,33 +114,34 @@ describe('lastContext IS the instance', () => {
 		const UserType = collection.define('UserCtx', function (this: {
 			name: string;
 			email: string;
-			readFullContext: () => any;
+			readFullContext: () => FullContextSnapshot | null;
 		}, data: { name: string; email: string }) {
 			this.name = data.name;
 			this.email = data.email;
 
 			// Add method to prototype
 			Object.getPrototypeOf(this).readFullContext = function () {
-				const ctx = current() as any;
-				if (!ctx) return null;
+				const currentCtx = current();
+				if (!isUserCtx(currentCtx)) { return null; }
 
-				const props = getProps(ctx);
-				return {
+				const props = getProps(currentCtx);
+				const snapshot: FullContextSnapshot = {
 					// Instance properties
-					name : ctx.name,
-					email: ctx.email,
-					role : ctx.role,
+					name  : currentCtx.name,
+					email : currentCtx.email,
+					role  : currentCtx.role,
 
 					// Construction history
-					typeName   : props?.__type__?.TypeName,
-					parentName : props?.__parent__?.constructor?.name,
-					args       : props?.__args__,
-					hasTimestamp: !!props?.__timestamp__,
+					typeName     : props?.__type__?.TypeName,
+					parentName   : props?.__parent__?.constructor?.name,
+					args         : props?.__args__,
+					hasTimestamp : !!props?.__timestamp__,
 				};
+				return snapshot;
 			};
 		});
 
-		const AdminType = UserType.define('AdminCtx', function (this: { role: string }, role: string) {
+		UserType.define('AdminCtx', function (this: { role: string }, role: string) {
 			this.role = role;
 		});
 
@@ -115,13 +149,15 @@ describe('lastContext IS the instance', () => {
 		attachHooks(collection);
 
 		// Create a chain: User -> Admin
-		const user = new UserType({ name: 'Alice', email: 'alice@test.com' });
+		const user = new UserType({ name : 'Alice', email : 'alice@test.com' });
 		const admin = new user.AdminCtx('admin');
 
 		clear();
 
 		const result = admin.readFullContext();
 
+		expect(result).not.toBeNull();
+		if (result === null) { return; }
 
 		// Instance properties
 		expect(result.name).toBe('Alice');

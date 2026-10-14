@@ -67,11 +67,11 @@ describe('long-lived object probe: does the chain behind one object grow with ev
 	});
 
 	it('100k finished calls on one held object: chainDepth(obj) === CALLS, alive === CALLS after GC', async () => {
-		const service = { id: 'svc' };
+		const service = { id : 'svc' };
 		hammer(service, CALLS);
 		await forceGcRounds(3);
 		const depth = chainDepth(service);
-		const alive = stats.alive;
+		const { alive } = stats;
 		const collected = stats.collectedEdges;
 		const heapMB = (process.memoryUsage().heapUsed / 1048576).toFixed(1);
 		console.log(`long-lived: chainDepth=${depth} alive=${alive} collectedEdges=${collected} heap=${heapMB}MB after ${CALLS} calls`);
@@ -83,7 +83,7 @@ describe('long-lived object probe: does the chain behind one object grow with ev
 	it('negative control: fresh short-lived object per call — chains collect after GC', async () => {
 		hammerAndDrop(CALLS);
 		await forceGcRounds(3);
-		const alive = stats.alive;
+		const { alive } = stats;
 		const collected = stats.collectedEdges;
 		const heapMB = (process.memoryUsage().heapUsed / 1048576).toFixed(1);
 		console.log(`short-lived: alive=${alive} collectedEdges=${collected} heap=${heapMB}MB after ${CALLS} calls`);
@@ -92,13 +92,15 @@ describe('long-lived object probe: does the chain behind one object grow with ev
 	}, 120_000);
 
 	it('row 3: 100k calls on one held object → newest edge .drop(obj) → GC (object stays held)', async () => {
-		const service = { id: 'svc' };
+		const service = { id : 'svc' };
 		hammer(service, CALLS);
-		const E = getFlow(service)[CALLS - 1]; // newest edge, a copy
-		E.drop(service); // targeted: svc unnamed + unanchored; links stay
+		// newest edge, a copy
+		const E = getFlow(service)[ CALLS - 1 ];
+		// targeted: svc unnamed + unanchored; links stay
+		E.drop(service);
 		const depthAfterDrop = chainDepth(service);
 		await forceGcRounds(3);
-		const alive = stats.alive;
+		const { alive } = stats;
 		const collected = stats.collectedEdges;
 		const heapMB = (process.memoryUsage().heapUsed / 1048576).toFixed(1);
 		// the next call starts a fresh story on the still-held object
@@ -113,14 +115,16 @@ describe('long-lived object probe: does the chain behind one object grow with ev
 	}, 120_000);
 
 	it('row 4: 100k calls on one held object → newest edge .drop() → GC (object stays held)', async () => {
-		const service = { id: 'svc' };
+		const service = { id : 'svc' };
 		hammer(service, CALLS);
-		const E = getFlow(service)[CALLS - 1];
-		E.drop(); // whole-trace wipe
-		expect(getFlow(E)).toHaveLength(1); // before GC: just [E]
+		const E = getFlow(service)[ CALLS - 1 ];
+		// whole-trace wipe
+		E.drop();
+		// before GC: just [E]
+		expect(getFlow(E)).toHaveLength(1);
 		const depthAfterDrop = chainDepth(service);
 		await forceGcRounds(3);
-		const alive = stats.alive;
+		const { alive } = stats;
 		const collected = stats.collectedEdges;
 		const heapMB = (process.memoryUsage().heapUsed / 1048576).toFixed(1);
 		const fn = wrap(function tick () { return 1; }, service);

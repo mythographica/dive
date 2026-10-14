@@ -20,12 +20,11 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
 	wrap,
-	recordCreation,
 	getRunningEdges,
 	getFlow,
 	clear,
+	type FlowEdge,
 } from '../src/index.js';
-import type { FlowEdge } from '../src/index.js';
 
 function byContext (list: FlowEdge[], ctx: object): FlowEdge | undefined {
 	const result = list.find(edge => edge.instance === ctx);

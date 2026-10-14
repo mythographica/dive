@@ -1,19 +1,23 @@
 /**
- * Child process: a request schedules a WRAPPED timer, the timer fires long
- * after the request returned, throws, and a REAL uncaughtException handler
- * reads the request's story from the Error.
+ * Child process: a request builds a chain and hands back a WRAPPED
+ * callback; main arms it as a timer that fires long after the request
+ * returned, throws, and a REAL uncaughtException handler reads the
+ * request's story from the Error.
  *
  * The object-linked thesis, on the failure path end to end:
  *   1. handleRequest() builds the ctx chain with recordCreation only (no
- *      mnemonica needed), schedules the late callback via setTimeout,
- *      returns NOTHING holding the chain.
+ *      mnemonica needed) and hands back the late callback — the wrapped
+ *      closure is the chain's only root (held by main's frame until the
+ *      timer is armed, exactly as the timer queue would hold it).
  *   2. An UNRELATED request is recorded right away, so the newest-wins
  *      switcher (lastContext) roots ITS chain — never ours. Our chain's
  *      only possible root is the wrapped timer closure.
- *   3. While the timer is pending: forced GC rounds (+ a macrotask so the
- *      FinalizationRegistry counters flush). In wrapped mode the chain
- *      must survive (stats.collectedEdges unchanged); in unwrapped mode
- *      it must collect (the exact contrast).
+ *   3. The GC phase runs (+ a macrotask so the FinalizationRegistry
+ *      counters flush) and the survival measurement is SEALED; only then
+ *      is the timer armed — a timer firing mid-measurement would report
+ *      before chainSurvived is computed. In wrapped mode the chain must
+ *      survive (stats.collectedEdges unchanged); in unwrapped mode it
+ *      must collect (the exact contrast).
  *   4. The timer fires -> throw -> uncaughtException -> the handler reports
  *      getFlow(err) / getErrorInstance(err) as JSON.
  *
@@ -45,8 +49,8 @@ function handleRequest () {
 	const late = mode === 'wrapped'
 		? wrap(function late () { throw new Error('late'); }, order)
 		: function late () { throw new Error('late'); };
-	setTimeout(late, 50);
-	// returns nothing holding req/order — the wrapped closure is the only root
+	// returns the callback but schedules nothing — main arms the timer
+	return late;
 }
 
 function unrelatedRequest () {
@@ -72,7 +76,7 @@ function report (via, err) {
 process.on('uncaughtException', (err) => report('uncaughtException', err));
 
 async function main () {
-	handleRequest();
+	const late = handleRequest();
 	unrelatedRequest(); // BEFORE the GC rounds: lastContext must root THIS
 	// chain, not ours — see the header. Our chain's only root is the wrap.
 	const collectedAfterRequest = stats.collectedEdges;
@@ -83,6 +87,8 @@ async function main () {
 	globalThis.gc();
 	const collectedAfterGc = stats.collectedEdges;
 	gcResult.chainSurvived = collectedAfterGc === collectedAfterRequest;
+	// arm the timer only after the measurement is sealed
+	setTimeout(late, 0);
 	await new Promise((resolve) => {
 		setTimeout(resolve, 500);
 	});

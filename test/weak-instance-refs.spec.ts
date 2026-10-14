@@ -22,8 +22,8 @@ import {
 	registerHook,
 	clear,
 	stats,
+	type FlowEdge,
 } from '../src/index.js';
-import type { FlowEdge } from '../src/index.js';
 
 const gcOf = globalThis as typeof globalThis & { gc?: () => void };
 
@@ -62,8 +62,8 @@ async function collectUntil (predicate: () => boolean, attempts = 60): Promise<b
 			setTimeout(resolve, 25);
 		});
 		if (predicate()) {
-			const result = true;
-			return result;
+			const collected = true;
+			return collected;
 		}
 	}
 	const result = false;
@@ -108,8 +108,8 @@ describe('weak instance refs', () => {
 		// instanceCollected are both visible through its getters (there is no
 		// whole-trace copy list — hooks are the observation surface)
 		const seen: FlowEdge[] = [];
-		registerHook('create', ({ edge }) => {
-			seen.push(edge);
+		registerHook('create', ({ edge: created }) => {
+			seen.push(created);
 		});
 		createAndDrop('WeakThing');
 		const edge = seen.find(item => item.name === 'WeakThing');
@@ -134,8 +134,8 @@ describe('weak instance refs', () => {
 		clear();
 		expect(stats.collectedInstances).toBe(0);
 		const seen: FlowEdge[] = [];
-		registerHook('create', ({ edge }) => {
-			seen.push(edge);
+		registerHook('create', ({ edge: created }) => {
+			seen.push(created);
 		});
 		createAndDrop('AfterReset');
 		const edge = seen.find(item => item.name === 'AfterReset');

@@ -6,8 +6,7 @@
  * lifecycle, and error enrichment.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTypesCollection } from 'mnemonica/module';
-import type { TypesCollection } from 'mnemonica/module';
+import { createTypesCollection, type TypesCollection } from 'mnemonica/module';
 
 import {
 	wrap,
@@ -25,7 +24,7 @@ describe('dive current()', () => {
 	});
 
 	it('clear removes the current context', () => {
-		const ctx = { id: 1 };
+		const ctx = { id : 1 };
 		wrap(() => undefined, ctx)();
 		clear();
 		expect(current()).toBeUndefined();
@@ -47,7 +46,7 @@ describe('dive wrap', () => {
 	beforeEach(() => clear());
 
 	it('restores the captured context when the function is called', () => {
-		const ctx = { id: 'wrapped' };
+		const ctx = { id : 'wrapped' };
 		const fn = wrap(() => current(), ctx);
 
 		expect(fn()).toBe(ctx);
@@ -55,10 +54,11 @@ describe('dive wrap', () => {
 	});
 
 	it('captures the ambient context at wrap time when no context is given', () => {
-		const ambient = { id: 'ambient' };
+		const ambient = { id : 'ambient' };
 		const captured = wrap(() => {
 			// inside here, current() is ambient — wrap a closure around it
-			return wrap(() => current());
+			const inner = wrap(() => current());
+			return inner;
 		}, ambient)();
 
 		clear();
@@ -66,8 +66,8 @@ describe('dive wrap', () => {
 	});
 
 	it('restores the previous context after invocation', () => {
-		const ctxA = { id: 'a' };
-		const ctxB = { id: 'b' };
+		const ctxA = { id : 'a' };
+		const ctxB = { id : 'b' };
 
 		const fn = wrap(() => {
 			expect(current()).toBe(ctxB);
@@ -103,7 +103,7 @@ describe('dive wrap', () => {
 	});
 
 	it('preserves constructor calls with new', () => {
-		const ctx = { id: 'ctor' };
+		const ctx = { id : 'ctor' };
 
 		class MyClass {
 			value: number;
@@ -115,8 +115,10 @@ describe('dive wrap', () => {
 			}
 		}
 
-		const WrappedClass = wrap(MyClass as unknown as (...args: unknown[]) => unknown, ctx);
-		const instance = new (WrappedClass as unknown as new () => MyClass)();
+		// wrap() types accept a class constructor (the class overload) and
+		// hand it back AS the class — `new WrappedClass()` typechecks
+		const WrappedClass = wrap(MyClass, ctx);
+		const instance = new WrappedClass();
 
 		expect(instance.value).toBe(42);
 		expect(instance).toBeInstanceOf(MyClass);
@@ -124,7 +126,7 @@ describe('dive wrap', () => {
 	});
 
 	it('restores context even when constructor throws', () => {
-		const ctx = { id: 'prev' };
+		const ctx = { id : 'prev' };
 
 		class BadClass {
 			constructor () {
@@ -132,18 +134,19 @@ describe('dive wrap', () => {
 			}
 		}
 
-		const WrappedClass = wrap(BadClass as unknown as (...args: unknown[]) => unknown);
+		const WrappedClass = wrap(BadClass);
 		wrap(() => {
-			expect(() => new (WrappedClass as unknown as new () => unknown)()).toThrow('intentional');
+			expect(() => new WrappedClass()).toThrow('intentional');
 			expect(current()).toBe(ctx);
 		}, ctx)();
 	});
 
 	it('wraps returned functions', () => {
-		const ctx = { id: 'return-fn' };
+		const ctx = { id : 'return-fn' };
 
 		const fn = wrap(() => {
-			return () => current();
+			const inner = () => current();
+			return inner;
 		}, ctx);
 
 		clear();
@@ -152,12 +155,14 @@ describe('dive wrap', () => {
 	});
 
 	it('wraps nested returned functions', () => {
-		const ctx = { id: 'nested' };
+		const ctx = { id : 'nested' };
 
 		const fn = wrap(() => {
-			return () => {
-				return () => current();
+			const levelOne = () => {
+				const levelTwo = () => current();
+				return levelTwo;
 			};
+			return levelOne;
 		}, ctx);
 
 		clear();
@@ -167,7 +172,7 @@ describe('dive wrap', () => {
 	});
 
 	it('does not double-wrap returned functions', () => {
-		const ctx = { id: 'no-double' };
+		const ctx = { id : 'no-double' };
 
 		const inner = wrap(() => current(), ctx);
 		const fn = wrap(() => inner, ctx);
@@ -179,10 +184,11 @@ describe('dive wrap', () => {
 	});
 
 	it('wraps Promise-resolved functions', async () => {
-		const ctx = { id: 'promise-fn' };
+		const ctx = { id : 'promise-fn' };
 
 		const fn = wrap(() => {
-			return Promise.resolve(() => current());
+			const resolved = Promise.resolve(() => current());
+			return resolved;
 		}, ctx);
 
 		clear();
@@ -191,18 +197,18 @@ describe('dive wrap', () => {
 	});
 
 	it('wraps Promise-resolved non-function values unchanged', async () => {
-		const fn = wrap(() => Promise.resolve({ value: 123 }));
+		const fn = wrap(() => Promise.resolve({ value : 123 }));
 		const result = await fn();
-		expect(result).toEqual({ value: 123 });
+		expect(result).toEqual({ value : 123 });
 	});
 
 	it('does not wrap non-function return values', () => {
-		const fn = wrap(() => ({ value: 42 }));
-		expect(fn()).toEqual({ value: 42 });
+		const fn = wrap(() => ({ value : 42 }));
+		expect(fn()).toEqual({ value : 42 });
 	});
 
 	it('restores context even when function throws', () => {
-		const ctx = { id: 'prev' };
+		const ctx = { id : 'prev' };
 
 		const fn = wrap(() => {
 			throw new Error('boom');
@@ -215,7 +221,7 @@ describe('dive wrap', () => {
 	});
 
 	it('handles rejected promises without losing context', async () => {
-		const ctx = { id: 'prev' };
+		const ctx = { id : 'prev' };
 
 		const fn = wrap(() => Promise.reject(new Error('async boom')));
 
@@ -233,22 +239,25 @@ describe('dive wrap: recursive arg propagation', () => {
 	beforeEach(() => clear());
 
 	it('wraps the function args passed INTO a wrapped fn (deferred call carries context)', () => {
-		const ctx = { id: 'CTX' };
+		const ctx = { id : 'CTX' };
 		let stored: (() => unknown) | undefined;
 		const f = wrap(function (cb: () => unknown) {
-			stored = cb; // store, do not call now
+			// store, do not call now
+			stored = cb;
 		}, ctx);
 
 		let seen: unknown;
 		f(() => { seen = current(); });
 
-		clear(); // ambient context wiped
-		stored!(); // call later — only carries ctx if the arg was wrapped
+		// ambient context wiped
+		clear();
+		// call later — only carries ctx if the arg was wrapped
+		stored!();
 		expect(seen).toBe(ctx);
 	});
 
 	it('propagates context recursively into args-of-args', () => {
-		const ctx = { id: 'CTX' };
+		const ctx = { id : 'CTX' };
 		let level2Ctx: unknown;
 		const f = wrap(function (cb: (inner: () => unknown) => void) {
 			// cb is a wrapped arg (level 1); hand it a function (level 2 arg-of-arg)
@@ -256,11 +265,14 @@ describe('dive wrap: recursive arg propagation', () => {
 		}, ctx);
 
 		let stored: (() => unknown) | undefined;
-		f((innerArg) => { stored = innerArg; }); // capture the level-2 fn for a later call
+		// capture the level-2 fn for a later call
+		f((innerArg) => { stored = innerArg; });
 
 		clear();
-		stored!(); // invoke the arg-of-arg after context is wiped
-		expect(level2Ctx).toBe(ctx); // recursion: the level-2 arg also carries ctx
+		// invoke the arg-of-arg after context is wiped
+		stored!();
+		// recursion: the level-2 arg also carries ctx
+		expect(level2Ctx).toBe(ctx);
 	});
 });
 
@@ -268,7 +280,7 @@ describe('dive generator wrapping', () => {
 	beforeEach(() => clear());
 
 	it('manual wrapping for generator body using wrap on each next', () => {
-		const ctx = { id: 'gen-manual' };
+		const ctx = { id : 'gen-manual' };
 
 		function* myGenerator () {
 			yield current();
@@ -311,16 +323,20 @@ describe('dive attachHooks: instance methods', () => {
 			this.value = 42;
 			const proto = Object.getPrototypeOf(this) as Record<string, unknown>;
 			proto.getContext = function (this: object) {
-				return current();
+				const result = current();
+				return result;
 			};
 			proto.invokeCallback = function (this: object, cb: () => unknown) {
-				return cb();
+				const result = cb();
+				return result;
 			};
 			proto.getFn = function (this: object) {
-				return () => current();
+				const result = () => current();
+				return result;
 			};
 			proto.getAsyncFn = async function (this: object) {
-				return () => current();
+				const result = () => current();
+				return result;
 			};
 			proto.throwError = function () {
 				throw new Error('boom');
@@ -342,7 +358,7 @@ describe('dive attachHooks: instance methods', () => {
 
 	it('restores previous context after method call', () => {
 		const MyType = defineWithMethods();
-		const prev = { id: 'prev' };
+		const prev = { id : 'prev' };
 
 		const instance = new MyType();
 		clear();
@@ -428,7 +444,7 @@ describe('dive error enrichment', () => {
 	});
 
 	it('getErrorInstance handles null/undefined', () => {
-		expect(getErrorInstance(null as unknown as Error)).toBeUndefined();
-		expect(getErrorInstance(undefined as unknown as Error)).toBeUndefined();
+		expect(getErrorInstance(null)).toBeUndefined();
+		expect(getErrorInstance(undefined)).toBeUndefined();
 	});
 });

@@ -60,7 +60,9 @@ When data flows through a system, instances carry their own context.
 The queue doesn't need to know about the original request — it just
 processes instances, and each instance brings its context via `wrap()`.
 
-**Execution flow = Data flow.**
+**Context rides the execution flow you wrap.** Dive's flow is the chain of
+wrapped calls, not the runtime's invocation flow — you place `wrap()` at
+the boundaries that matter, and in most cases that is enough.
 
 ### ALS Problem
 
@@ -162,16 +164,16 @@ import { wrap, current, getErrorInstance } from '@mnemonica/dive';
 const job = { id: 'req-123' };
 
 // capture the context now; it is restored at invocation time
-const process = wrap(() => {
+const task = wrap(() => {
   current() === job; // true
 }, job);
 
 // even 30 seconds later, from a decoupled queue consumer:
-setTimeout(process, 30_000);
+setTimeout(task, 30_000);
 ```
 
-With mnemonica, construction itself becomes the context switch — via the
-adapter's `attachHooks`:
+With mnemonica, construction itself becomes the context switch — via
+`@mnemonica/otel`'s `attachHooks`:
 
 ```typescript
 import { attachHooks } from '@mnemonica/otel';
@@ -199,11 +201,14 @@ current() === instance; // true
 ### `wrap(fn, context?)` / `wrap(fn, label?)` / `wrap(fn, context, label)`
 
 ```typescript
-wrap<T extends (...args: unknown[]) => unknown>(
-  fn: T,
-  context?: object,
-  label?: string
-): T;
+// any function — typed parameters are kept exactly:
+wrap<T extends AnyFn>(fn: T, label?: string): T;
+wrap<T extends AnyFn>(fn: T, context?: object, label?: string): T;
+// a class constructor is accepted too — and comes back typed AS the class,
+// so new Wrapped() typechecks with no cast:
+wrap<C extends abstract new (...args: never[]) => unknown>(
+  ctor: C, contextOrLabel?: object | string, label?: string
+): C;
 ```
 
 Capture context at wrap-time (explicit, or the current ambient context),
@@ -295,18 +300,23 @@ interface FlowEdge {
   // from the newest-wins ambient (best-effort — distrust it under
   // concurrency); undefined when the edge carries no instance
   instanceSource?: 'explicit' | 'ambient';
+  // true once the edge's instance was GC-collected — edge.instance
+  // derefs to undefined from then on
+  instanceCollected?: boolean;
 }
 ```
 
 ### `getErrorInstance(error)`
 
 ```typescript
-getErrorInstance(error: Error): object | undefined;
+getErrorInstance(error: unknown): object | undefined;
 ```
 
 The data pinned to an error. The error is pinned **once**, at the deepest
 wrapped boundary it passed through — so this points at the failure site,
-not at some outer re-throw.
+not at some outer re-throw. A non-object thrown value (a string, a number)
+still settles its edge as `'error'` — it just pins nothing: there is no
+carrier for the symbols.
 
 ### `getRunningEdges()`
 
@@ -449,8 +459,8 @@ Events:
 
 - **`enter`** — right after the edge is recorded, while `cursor` and
   `lastContext` hold the truthful values. Payload: the fresh **edge object
-  itself** (attach your own symbols to it — a span id gives you the reverse
-  join for free) plus the invocation `args` by reference.
+  itself** (key a `WeakMap` on it — a span gives you the reverse join for
+  free, and the map pins nothing) plus the invocation `args` by reference.
 - **`leave`** — the sync close, with the edge's final `status`/`duration` and
   what the wrap produced (plain value / wrapped function / tapped promise;
   `undefined` when the call threw).
@@ -471,15 +481,24 @@ Subscriber exceptions are contained per-subscriber: a throwing hook degrades
 its own observability, never the trace.
 
 ```typescript
-import { registerHook } from '@mnemonica/dive';
+import { registerHook, type FlowEdge } from '@mnemonica/dive';
 
-// correlate an OTel span with every wrapped call
-registerHook('enter', ({ edge, args }) => {
-  const span = tracer.startSpan(edge.name);
-  (edge as Record<symbol, unknown>)[SPAN] = span;
+// correlate an OTel span with every wrapped call: the enter, leave and
+// settle payloads carry the SAME live edge object, so a WeakMap joins them
+// (and pins nothing — the trace's own retention rules still govern)
+const spans = new WeakMap<FlowEdge, Span>();
+
+registerHook('enter', ({ edge }) => {
+  spans.set(edge, tracer.startSpan(edge.name));
+});
+// a sync call is done when it leaves; async work closes at settle —
+// "the function returned" is not "the work is done"
+registerHook('leave', ({ edge, result }) => {
+  if (result instanceof Promise) return;
+  spans.get(edge)?.end();
 });
 registerHook('settle', ({ edge, error }) => {
-  const span = (edge as Record<symbol, unknown>)[SPAN] as Span | undefined;
+  const span = spans.get(edge);
   if (error) span?.recordException(error);
   span?.end();
 });
@@ -499,8 +518,9 @@ The trace is what makes concurrent flows honest. Its parentage rule:
   it would merge two requests into one branch.
 
 Construction edges always parent on the **data-flow parent** (the parent
-instance's own latest edge), so the trace forms a forest isomorphic to the
-mnemonica instance chain:
+instance's own latest edge) — so the construction edges mirror the
+mnemonica instance chain; the call/method edges between them are dive's
+own execution record:
 
 ```
 create:RequestData ── create:RouteData ── method:load ── call:onLoaded
@@ -572,9 +592,10 @@ Running traces are observable — walk from the counters to the anchor:
    `running` is 0, finished chains are being pinned somewhere.
 2. **`chainDepth(obj)` on your suspects.** A depth that grows with every
    call on one object names the accumulator (see the section above).
-3. **`getFlow(obj)`** walks the linked list newest → root: each edge shows
-   `kind`, `name`, and the instance it happened to — you see exactly which
-   object anchors the chain and which calls built it.
+3. **`getFlow(obj)`** starts from the newest edge and returns the branch
+   **oldest first**: each edge shows `kind`, `name`, and the instance it
+   happened to — you see exactly which object anchors the chain and which
+   calls built it.
 4. Choose at the anchor — this retention is by design, and the choice is
    yours: keep the story (a long-lived object's history is often exactly
    what you want), give the long-lived work a fresh per-operation context
@@ -594,8 +615,9 @@ macrotask, then read.
 
 For NestJS there is a dedicated adapter:
 [`@mnemonica/nestjs`](https://www.npmjs.com/package/@mnemonica/nestjs) —
-module system, validation pipe, interceptors, and `attachHooks()` (the dive ↔
-mnemonica lifecycle wiring). `MnemonicaModule.forRoot({ thunderstruck: true })`
+module system, validation pipe, interceptors, and a re-export of
+`attachHooks()` from `@mnemonica/otel` (the dive ↔ mnemonica lifecycle
+wiring). `MnemonicaModule.forRoot({ thunderstruck: true })`
 activates the whole bundle.
 
 Outside NestJS, call `attachHooks(collection)` from `@mnemonica/otel` once at
@@ -617,7 +639,7 @@ lifecycle events — the full wiring source ships in
 | Scenario | ALS | Dive |
 |----------|-----|------|
 | Simple async chain | ✅ Works | ✅ Works |
-| Synchronous instance creation | ❌ Loses context | ✅ Shifts per instance |
+| Synchronous instance creation | One ambient store — no per-instance switch | ✅ Shifts per instance |
 | setTimeout 30s later | ❌ Store gone | ✅ Context preserved |
 | Random queue shuffle | ❌ No traceability | ✅ Every failure carries data + flow |
 | Nested construction error | ❌ No parent context | ✅ Parent in error |
@@ -738,8 +760,8 @@ The contract between runtimes is a **correlation key carried as data**:
    the uuid links the new flow branch back to the original one.
 3. Across the wire, let the tracer built for it do its job: the
    `@mnemonica/otel` providers emit OpenTelemetry spans carrying
-   `dive.instance.uuid` (the NestJS adapter wires them in), so Jaeger
-   stitches what dive cannot see.
+   `dive.edge_id` / `dive.kind` / `dive.name`, so Jaeger stitches what dive
+   cannot see.
 
 Where dive differs from ALS is *which* in-process boundary it pins to. ALS
 binds context to the async **resource** chain — ambient, correct only while
@@ -761,6 +783,7 @@ sides see different traces. Pick one entry style per process and stay with it.
 
 ## Repository Layout
 
-The published package is `build/` + `build-cjs/` + this README + LICENSE.
+The published package is `build/` + `build-cjs/` + this README + `SKILL.md`
+(the wiring guide) + LICENSE.
 For maintainers — internals, invariants, and how to work on dive itself —
 see `AGENTS.md` in the repository.

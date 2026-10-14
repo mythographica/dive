@@ -42,15 +42,18 @@ describe('attachHooks: preCreation enters parent context', () => {
 
 		let seenDuringCtor: unknown;
 		Parent.define('Child', function (this: { kind: string }) {
-			seenDuringCtor = current(); // set by preCreation, before postCreation
+			// set by preCreation, before postCreation
+			seenDuringCtor = current();
 			this.kind = 'child';
 		});
 
 		clear();
 		const child = new parent.Child();
 
-		expect(seenDuringCtor).toBe(parent); // preCreation entered the parent
-		expect(current()).toBe(child); // postCreation then entered the child
+		// preCreation entered the parent
+		expect(seenDuringCtor).toBe(parent);
+		// postCreation then entered the child
+		expect(current()).toBe(child);
 	});
 
 	it('wraps a function arg, and an UNUSED callback upgrades to the built instance', () => {
@@ -64,7 +67,8 @@ describe('attachHooks: preCreation enters parent context', () => {
 
 		let received: (() => unknown) | undefined;
 		Parent.define('Child', function (this: { kind: string }, cb: () => unknown) {
-			received = cb; // STORED, not invoked during construction
+			// STORED, not invoked during construction
+			received = cb;
 			this.kind = 'child';
 		});
 
@@ -73,9 +77,11 @@ describe('attachHooks: preCreation enters parent context', () => {
 		const child = new parent.Child(original);
 
 		expect(received).toBeTypeOf('function');
-		expect(received).not.toBe(original); // dive-wrapped, not the raw function
+		// dive-wrapped, not the raw function
+		expect(received).not.toBe(original);
 
-		clear(); // even with ambient context wiped…
+		// even with ambient context wiped…
+		clear();
 		// …the callback now resolves to the INSTANCE it belongs to: preCreation
 		// captured the parent, postCreation upgraded it because it was never used.
 		expect(received!()).toBe(child);
@@ -93,7 +99,8 @@ describe('attachHooks: preCreation enters parent context', () => {
 		let stored: (() => unknown) | undefined;
 		let duringCtor: unknown;
 		Parent.define('Child', function (this: { kind: string }, cb: () => unknown) {
-			duringCtor = cb(); // INVOKED during construction — locks to parent
+			// INVOKED during construction — locks to parent
+			duringCtor = cb();
 			stored = cb;
 			this.kind = 'child';
 		});
@@ -101,7 +108,8 @@ describe('attachHooks: preCreation enters parent context', () => {
 		clear();
 		new parent.Child(() => current());
 
-		expect(duringCtor).toBe(parent); // during construction, context is the parent
+		// during construction, context is the parent
+		expect(duringCtor).toBe(parent);
 
 		clear();
 		// it was used, so postCreation does NOT upgrade it — later calls stay parent

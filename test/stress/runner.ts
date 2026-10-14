@@ -39,7 +39,8 @@ export async function runStressTest (
 	clearRegistry();
 	clearDlq();
 
-	const requestId = Math.random().toString(36).slice(2, 12);
+	const requestId = Math.random().toString(36)
+		.slice(2, 12);
 	const instances : object[] = [];
 
 	for (let i = 0; i < count; i++) {
@@ -47,7 +48,7 @@ export async function runStressTest (
 		const instance = new StressEntity({
 			uuid,
 			requestId,
-			value: Math.random() > 0.5 ? Math.floor(Math.random() * 100) : 'string-value',
+			value : Math.random() > 0.5 ? Math.floor(Math.random() * 100) : 'string-value',
 		});
 		instances.push(instance);
 	}
@@ -55,10 +56,11 @@ export async function runStressTest (
 	const registered = registerInstances(instances, ratio);
 	await startConsumer({ timeoutMs, noThrow });
 
-	return {
+	const result : StressTestResult = {
 		requestId,
-		created    : instances.length,
+		created : instances.length,
 		registered,
-		report     : produceReport(),
+		report  : produceReport(),
 	};
+	return result;
 }

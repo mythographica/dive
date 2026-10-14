@@ -32,12 +32,12 @@ export function attachHooks (collection: HookableCollection): void {
 		if (parent) {
 			enterContext(parent);
 		}
-		const args = hookData.args;
+		const { args } = hookData;
 		if (Array.isArray(args)) {
 			for (let i = 0; i < args.length; i++) {
-				const arg = args[i];
+				const arg = args[ i ];
 				if (typeof arg === 'function' && !isWrappedFunction(arg)) {
-					args[i] = wrapConstructorArg(arg as (...a: unknown[]) => unknown, parent);
+					args[ i ] = wrapConstructorArg(arg as (...a: unknown[]) => unknown, parent);
 				}
 			}
 		}

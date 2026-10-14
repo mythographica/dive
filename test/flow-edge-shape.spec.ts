@@ -22,8 +22,8 @@ import {
 	getFlow,
 	registerHook,
 	clear,
+	type FlowEdge,
 } from '../src/index.js';
-import type { FlowEdge } from '../src/index.js';
 
 // %HasFastProperties needs natives syntax; NODE_OPTIONS rejects that flag,
 // so it is switched on here, before the probe function is compiled
@@ -53,7 +53,7 @@ function createCopyAndDrop (name: string): FlowEdge {
 	const instance = { marker : name };
 	recordCreation(name, instance);
 	enterContext(undefined);
-	const result = getFlow(instance)[0];
+	const [ result ] = getFlow(instance);
 	return result;
 }
 
@@ -118,15 +118,15 @@ describe('FlowEdge shape', () => {
 		createAndDropShared('Shared', 3);
 		const shared = seen.filter((item) => item.name === 'Shared');
 		expect(shared.length).toBe(3);
-		const collected = await awaitCollected(shared[0]);
+		const collected = await awaitCollected(shared[ 0 ]);
 		expect(collected).toBe(true);
 		expect(shared.map((edge) => edge.instanceCollected)).toEqual([ true, true, true ]);
 	});
 
 	it('instanceCollected turns true on collection without waiting for a notification', async () => {
 		const seen: FlowEdge[] = [];
-		registerHook('create', ({ edge }) => {
-			seen.push(edge);
+		registerHook('create', ({ edge: created }) => {
+			seen.push(created);
 		});
 		createAndDrop('Gone');
 		const edge = seen.find((item) => item.name === 'Gone');

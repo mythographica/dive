@@ -81,7 +81,9 @@ ambient attributions.
   `getFlow(instance)` — the instance's own latest branch; `getFlow()` — the
   current cursor's branch (empty at rest).
 - `getErrorInstance(error)` — the data pinned at the failure site (the
-  deepest wrapped boundary, not an outer re-throw).
+  deepest wrapped boundary, not an outer re-throw). A non-object throw
+  (a string, a number) still settles its edge as `error` but pins
+  nothing — no carrier.
 - `getRunningEdges()` — the calls genuinely in flight right now; the
   suspect set inside a crash handler. Note: construction edges are recorded
   at completion, so they never appear here.
@@ -108,7 +110,8 @@ ambient attributions.
   (the npm script supplies `--expose-gc`).
 - When `stats.alive` grows at rest (`running` is 0), find the anchor:
   `chainDepth(suspect)` grows per call on the accumulator; `getFlow(obj)`
-  walks newest → root showing kind/name/instance per edge. Then choose —
+  starts from the newest edge and returns the branch oldest first, with
+  kind/name/instance per edge. Then choose —
   this retention is by design, not a defect: keep the story; or fresh
   per-op context; or `edge.drop(obj)` to remove one object from its trace
   (edges/links stay); or `edge.drop()` to wipe the whole trace

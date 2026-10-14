@@ -37,10 +37,11 @@ interface ChildReport {
 }
 
 function runChild (mode: 'wrapped' | 'unwrapped') {
-	const out = execFileSync(process.execPath, ['--expose-gc', childScript, mode], {
+	const out = execFileSync(process.execPath, [ '--expose-gc', childScript, mode ], {
 		encoding : 'utf8',
 	});
-	return JSON.parse(out) as ChildReport;
+	const report = JSON.parse(out) as ChildReport;
+	return report;
 }
 
 describe('REAL failure path: wrapped timer long after the request returned', () => {
@@ -54,8 +55,8 @@ describe('REAL failure path: wrapped timer long after the request returned', () 
 		expect(r.diveInHandler).toBe('order-1');
 		// the flow: oldest first, the request's own branch only — no
 		// create:UnrelatedRequest / create:UnrelatedOrder from step 2
-		expect(r.flowKinds).toEqual(['create:Request', 'create:Order', 'call:late']);
-		expect(r.flowStatus).toEqual(['ok', 'ok', 'error']);
+		expect(r.flowKinds).toEqual([ 'create:Request', 'create:Order', 'call:late' ]);
+		expect(r.flowStatus).toEqual([ 'ok', 'ok', 'error' ]);
 	});
 
 	it('unwrapped negative control: the chain collects under GC; no pin, empty flow, no data', () => {

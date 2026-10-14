@@ -31,7 +31,7 @@ describe('re-wrap policy', () => {
 	});
 
 	it('wrap of a wrapper with no context is idempotent', () => {
-		const ctx = { id: 'a' };
+		const ctx = { id : 'a' };
 		const fn = () => 1;
 		const w1 = wrap(fn, ctx);
 		const w2 = wrap(w1);
@@ -39,7 +39,7 @@ describe('re-wrap policy', () => {
 	});
 
 	it('wrap of a wrapper with the SAME context is idempotent', () => {
-		const ctx = { id: 'a' };
+		const ctx = { id : 'a' };
 		const fn = () => 1;
 		const w1 = wrap(fn, ctx);
 		const w2 = wrap(w1, ctx);
@@ -47,8 +47,8 @@ describe('re-wrap policy', () => {
 	});
 
 	it('wrap of a wrapper with a DIFFERENT context shadows: new wrapper, original fn', () => {
-		const request = { id: 'request' };
-		const service = { id: 'service' };
+		const request = { id : 'request' };
+		const service = { id : 'service' };
 		const fn = () => 1;
 		const w1 = wrap(fn, request);
 		const w2 = wrap(w1, service);
@@ -58,57 +58,61 @@ describe('re-wrap policy', () => {
 		// the shadow fired the handoff: a recontext edge on the new context
 		const serviceFlow = getFlow(service);
 		expect(serviceFlow.length).toBe(1);
-		expect(serviceFlow[0].kind).toBe('recontext');
-		expect(serviceFlow[0].instance).toBe(service);
+		expect(serviceFlow[ 0 ].kind).toBe('recontext');
+		expect(serviceFlow[ 0 ].instance).toBe(service);
 		// the old context has no edges yet — nothing to parent on
-		expect(serviceFlow[0].parentId).toBeNull();
+		expect(serviceFlow[ 0 ].parentId).toBeNull();
 	});
 
 	it('the handoff edge parents on the OLD context latest edge, so getFlow crosses the re-root', () => {
-		const request = { id: 'request' };
-		const service = { id: 'service' };
+		const request = { id : 'request' };
+		const service = { id : 'service' };
 		const fn = () => 1;
 
 		const w1 = wrap(fn, request);
-		w1(); // request story: call edge
+		// request story: call edge
+		w1();
 		const requestFlow = getFlow(request);
 		expect(requestFlow.length).toBe(1);
 
-		const w2 = wrap(w1, service); // handoff: request → service
-		w2(); // service story continues from the handoff
+		// handoff: request → service
+		const w2 = wrap(w1, service);
+		// service story continues from the handoff
+		w2();
 
 		const serviceFlow = getFlow(service);
 		expect(serviceFlow.length).toBe(3);
 		// oldest first: request's call, the handoff, service's call
-		expect(serviceFlow[0].kind).toBe('call');
-		expect(serviceFlow[0].instance).toBe(request);
-		expect(serviceFlow[1].kind).toBe('recontext');
-		expect(serviceFlow[1].instance).toBe(service);
-		expect(serviceFlow[1].parentId).toBe(serviceFlow[0].id);
-		expect(serviceFlow[2].kind).toBe('call');
-		expect(serviceFlow[2].instance).toBe(service);
-		expect(serviceFlow[2].parentId).toBe(serviceFlow[1].id);
+		expect(serviceFlow[ 0 ].kind).toBe('call');
+		expect(serviceFlow[ 0 ].instance).toBe(request);
+		expect(serviceFlow[ 1 ].kind).toBe('recontext');
+		expect(serviceFlow[ 1 ].instance).toBe(service);
+		expect(serviceFlow[ 1 ].parentId).toBe(serviceFlow[ 0 ].id);
+		expect(serviceFlow[ 2 ].kind).toBe('call');
+		expect(serviceFlow[ 2 ].instance).toBe(service);
+		expect(serviceFlow[ 2 ].parentId).toBe(serviceFlow[ 1 ].id);
 	});
 
 	it('the OLD wrapper keeps telling the OLD story after shadowing', () => {
-		const request = { id: 'request' };
-		const service = { id: 'service' };
+		const request = { id : 'request' };
+		const service = { id : 'service' };
 		const fn = () => 1;
 
 		const w1 = wrap(fn, request);
-		const w2 = wrap(w1, service);
+		wrap(w1, service);
 
-		w1(); // must still record under request, untouched by the shadow
+		// must still record under request, untouched by the shadow
+		w1();
 		const requestFlow = getFlow(request);
 		expect(requestFlow.length).toBe(1);
-		expect(requestFlow[0].kind).toBe('call');
-		expect(requestFlow[0].instance).toBe(request);
-		expect(requestFlow[0].parentId).toBeNull();
+		expect(requestFlow[ 0 ].kind).toBe('call');
+		expect(requestFlow[ 0 ].instance).toBe(request);
+		expect(requestFlow[ 0 ].parentId).toBeNull();
 	});
 
 	it('auto-wrap crossings never shadow: args keep their story through another flow', () => {
-		const request = { id: 'request' };
-		const service = { id: 'service' };
+		const request = { id : 'request' };
+		const service = { id : 'service' };
 		const fn = () => 1;
 
 		const w1 = wrap(fn, request);
@@ -119,7 +123,7 @@ describe('re-wrap policy', () => {
 		// no handoff was recorded: the service branch is a single call edge
 		const serviceFlow = getFlow(service);
 		expect(serviceFlow.length).toBe(1);
-		expect(serviceFlow[0].kind).toBe('call');
+		expect(serviceFlow[ 0 ].kind).toBe('call');
 		expect(serviceFlow.every((edge) => edge.kind !== 'recontext')).toBe(true);
 
 		// and the callback's own invocation stayed on the request story:
@@ -128,14 +132,14 @@ describe('re-wrap policy', () => {
 		// but no recontext edge exists and the context never switched.
 		const requestFlow = getFlow(request);
 		expect(requestFlow.length).toBe(2);
-		expect(requestFlow[0].instance).toBe(service);
-		expect(requestFlow[1].instance).toBe(request);
-		expect(requestFlow[1].parentId).toBe(requestFlow[0].id);
+		expect(requestFlow[ 0 ].instance).toBe(service);
+		expect(requestFlow[ 1 ].instance).toBe(request);
+		expect(requestFlow[ 1 ].parentId).toBe(requestFlow[ 0 ].id);
 	});
 
 	it('constructor-arg holders cannot be shadowed (no origin info by design)', () => {
-		const parent = { id: 'parent' };
-		const other = { id: 'other' };
+		const parent = { id : 'parent' };
+		const other = { id : 'other' };
 		const fn = () => 1;
 		const held = wrapConstructorArg(fn, parent);
 		const rewrapped = wrap(held, other);
@@ -153,25 +157,30 @@ describe('trace honesty: continuation points are objects', () => {
 	// OBJECTS held by latestEdges — a live object's latest edge is alive by
 	// definition; nothing can cut a story from under a live object
 	it('a live instance continues from its latest edge across interleaved flows', () => {
-		const ctxA = { id: 'a' };
-		const ctxB = { id: 'b' };
+		const ctxA = { id : 'a' };
+		const ctxB = { id : 'b' };
 		const fnA = () => 'a';
 		const fnB = () => 'b';
 
 		const wA = wrap(fnA, ctxA);
 		const wB = wrap(fnB, ctxB);
 
-		wA(); // e1 — ctxA's only edge
-		wB(); // e2
-		wB(); // e3
-		wB(); // e4 — ctxB's story interleaves; ctxA's continuation stays e1
+		// e1 — ctxA's only edge
+		wA();
+		// e2
+		wB();
+		// e3
+		wB();
+		// e4 — ctxB's story interleaves; ctxA's continuation stays e1
+		wB();
 
-		wA(); // e5 — continues from e1: ctxA is alive, so is its latest edge
+		// e5 — continues from e1: ctxA is alive, so is its latest edge
+		wA();
 
 		const flowA = getFlow(ctxA);
 		expect(flowA.length).toBe(2);
-		expect(flowA[0].id).toBe(1);
-		expect(flowA[0].parentId).toBeNull();
-		expect(flowA[1].parentId).toBe(1);
+		expect(flowA[ 0 ].id).toBe(1);
+		expect(flowA[ 0 ].parentId).toBeNull();
+		expect(flowA[ 1 ].parentId).toBe(1);
 	});
 });

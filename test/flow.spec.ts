@@ -15,8 +15,7 @@
  *     'running' means genuinely unsettled
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTypesCollection } from 'mnemonica/module';
-import type { TypesCollection } from 'mnemonica/module';
+import { createTypesCollection, type TypesCollection } from 'mnemonica/module';
 
 import {
 	wrap,
@@ -44,15 +43,15 @@ describe('trace: construction edges follow the data flow', () => {
 
 		const flow = getFlow(instance);
 		expect(flow.length).toBe(1);
-		expect(flow[0].kind).toBe('create');
-		expect(flow[0].name).toBe('Root');
-		expect(flow[0].instance).toBe(instance);
-		expect(flow[0].parentId).toBeNull();
+		expect(flow[ 0 ].kind).toBe('create');
+		expect(flow[ 0 ].name).toBe('Root');
+		expect(flow[ 0 ].instance).toBe(instance);
+		expect(flow[ 0 ].parentId).toBeNull();
 		// recordCreation fires at postCreation — the construction HAS completed,
 		// so the edge closes immediately ('ok', unmeasured duration: 0);
 		// 'running' is reserved for genuinely unsettled async work.
-		expect(flow[0].status).toBe('ok');
-		expect(flow[0].duration).toBe(0);
+		expect(flow[ 0 ].status).toBe('ok');
+		expect(flow[ 0 ].duration).toBe(0);
 	});
 
 	it('a subtype creation parents on the PARENT INSTANCE story, not on whatever ran last', () => {
@@ -71,9 +70,10 @@ describe('trace: construction edges follow the data flow', () => {
 
 		const flow = getFlow(childOfA);
 		expect(flow.length).toBe(2);
-		expect(flow[0].instance).toBe(a); // parent create edge
-		expect(flow[1].instance).toBe(childOfA);
-		expect(flow[1].parentId).toBe(flow[0].id);
+		// parent create edge
+		expect(flow[ 0 ].instance).toBe(a);
+		expect(flow[ 1 ].instance).toBe(childOfA);
+		expect(flow[ 1 ].parentId).toBe(flow[ 0 ].id);
 		// b is nowhere in a's branch
 		expect(flow.some((edge) => edge.instance === b)).toBe(false);
 	});
@@ -87,9 +87,9 @@ describe('trace: construction edges follow the data flow', () => {
 
 		expect(getFlow(a).length).toBe(1);
 		expect(getFlow(b).length).toBe(1);
-		expect(getFlow(a)[0].id).not.toBe(getFlow(b)[0].id);
-		expect(getFlow(a)[0].parentId).toBeNull();
-		expect(getFlow(b)[0].parentId).toBeNull();
+		expect(getFlow(a)[ 0 ].id).not.toBe(getFlow(b)[ 0 ].id);
+		expect(getFlow(a)[ 0 ].parentId).toBeNull();
+		expect(getFlow(b)[ 0 ].parentId).toBeNull();
 	});
 });
 
@@ -115,7 +115,8 @@ describe('trace: method calls continue the instance story', () => {
 				return 'inner';
 			};
 			proto.outer = function (this: { inner: () => string }) {
-				return this.inner();
+				const result = this.inner();
+				return result;
 			};
 		});
 		return Worker;
@@ -129,13 +130,13 @@ describe('trace: method calls continue the instance story', () => {
 
 		const flow = getFlow(worker);
 		expect(flow.length).toBe(2);
-		expect(flow[0].kind).toBe('create');
-		expect(flow[1].kind).toBe('method');
-		expect(flow[1].name).toBe('inner');
-		expect(flow[1].instance).toBe(worker);
-		expect(flow[1].parentId).toBe(flow[0].id);
-		expect(flow[1].status).toBe('ok');
-		expect(flow[1].duration).toBeGreaterThanOrEqual(0);
+		expect(flow[ 0 ].kind).toBe('create');
+		expect(flow[ 1 ].kind).toBe('method');
+		expect(flow[ 1 ].name).toBe('inner');
+		expect(flow[ 1 ].instance).toBe(worker);
+		expect(flow[ 1 ].parentId).toBe(flow[ 0 ].id);
+		expect(flow[ 1 ].status).toBe('ok');
+		expect(flow[ 1 ].duration).toBeGreaterThanOrEqual(0);
 	});
 
 	it('a nested method call parents on the CALLER edge (execution truth)', () => {
@@ -147,10 +148,10 @@ describe('trace: method calls continue the instance story', () => {
 		// latest edge for worker is inner()'s edge; walking it must show
 		// create → outer → inner
 		const flow = getFlow(worker);
-		expect(flow.map((edge) => edge.name)).toEqual(['Worker', 'outer', 'inner']);
-		expect(flow.map((edge) => edge.kind)).toEqual(['create', 'method', 'method']);
-		expect(flow[2].parentId).toBe(flow[1].id);
-		expect(flow[1].parentId).toBe(flow[0].id);
+		expect(flow.map((edge) => edge.name)).toEqual([ 'Worker', 'outer', 'inner' ]);
+		expect(flow.map((edge) => edge.kind)).toEqual([ 'create', 'method', 'method' ]);
+		expect(flow[ 2 ].parentId).toBe(flow[ 1 ].id);
+		expect(flow[ 1 ].parentId).toBe(flow[ 0 ].id);
 	});
 
 	it('two instances calling methods interleaved keep separate branches', () => {
@@ -166,9 +167,9 @@ describe('trace: method calls continue the instance story', () => {
 		const flowB = getFlow(b);
 		// sequential calls on the same instance chain linearly: each call
 		// continues the instance's own timeline (create → inner → inner)
-		expect(flowA.map((edge) => edge.name)).toEqual(['Worker', 'inner', 'inner']);
+		expect(flowA.map((edge) => edge.name)).toEqual([ 'Worker', 'inner', 'inner' ]);
 		expect(flowA.every((edge) => edge.instance === a)).toBe(true);
-		expect(flowB.map((edge) => edge.name)).toEqual(['Worker', 'inner']);
+		expect(flowB.map((edge) => edge.name)).toEqual([ 'Worker', 'inner' ]);
 		expect(flowB.every((edge) => edge.instance === b)).toBe(true);
 	});
 });
@@ -177,7 +178,7 @@ describe('trace: errors are flight recorders', () => {
 	beforeEach(() => clear());
 
 	it('an error thrown in a wrapped fn carries its branch and its data', () => {
-		const ctx = { id: 'origin', requestId: 'req-1' };
+		const ctx = { id : 'origin', requestId : 'req-1' };
 		const err = new Error('boom');
 
 		try {
@@ -191,14 +192,14 @@ describe('trace: errors are flight recorders', () => {
 
 			const flow = getFlow(err as Error);
 			expect(flow.length).toBe(1);
-			expect(flow[0].instance).toBe(ctx);
-			expect(flow[0].status).toBe('error');
+			expect(flow[ 0 ].instance).toBe(ctx);
+			expect(flow[ 0 ].status).toBe('error');
 		}
 	});
 
 	it('the DEEPEST edge wins: a re-thrown error stays pinned at the failure site', () => {
-		const innerCtx = { id: 'inner' };
-		const outerCtx = { id: 'outer' };
+		const innerCtx = { id : 'inner' };
+		const outerCtx = { id : 'outer' };
 		const err = new Error('deep boom');
 
 		const inner = wrap(() => {
@@ -215,15 +216,17 @@ describe('trace: errors are flight recorders', () => {
 
 			const flow = getFlow(caught as Error);
 			expect(flow.length).toBe(2);
-			expect(flow[0].instance).toBe(outerCtx); // outer called inner
-			expect(flow[1].instance).toBe(innerCtx);
-			expect(flow[1].status).toBe('error');
-			expect(flow[0].status).toBe('error'); // error propagated through outer too
+			// outer called inner
+			expect(flow[ 0 ].instance).toBe(outerCtx);
+			expect(flow[ 1 ].instance).toBe(innerCtx);
+			expect(flow[ 1 ].status).toBe('error');
+			// error propagated through outer too
+			expect(flow[ 0 ].status).toBe('error');
 		}
 	});
 
 	it('a promise rejection pins the error to the call that produced it', async () => {
-		const ctx = { id: 'async-origin' };
+		const ctx = { id : 'async-origin' };
 		const err = new Error('async boom');
 
 		const fn = wrap(() => Promise.reject(err), ctx);
@@ -232,8 +235,8 @@ describe('trace: errors are flight recorders', () => {
 		expect(getErrorInstance(err)).toBe(ctx);
 		const flow = getFlow(err);
 		expect(flow.length).toBe(1);
-		expect(flow[0].instance).toBe(ctx);
-		expect(flow[0].status).toBe('error');
+		expect(flow[ 0 ].instance).toBe(ctx);
+		expect(flow[ 0 ].status).toBe('error');
 	});
 
 	it('a failed nested construction records the failure under the surviving parent', () => {
@@ -260,12 +263,13 @@ describe('trace: errors are flight recorders', () => {
 
 		const flow = getFlow(caught as Error);
 		expect(flow.length).toBe(2);
-		expect(flow[0].kind).toBe('create');
-		expect(flow[0].instance).toBe(parent); // the surviving parent's story
-		expect(flow[1].kind).toBe('create');
-		expect(flow[1].name).toBe('Broken');
-		expect(flow[1].status).toBe('error');
-		expect(flow[1].parentId).toBe(flow[0].id);
+		expect(flow[ 0 ].kind).toBe('create');
+		// the surviving parent's story
+		expect(flow[ 0 ].instance).toBe(parent);
+		expect(flow[ 1 ].kind).toBe('create');
+		expect(flow[ 1 ].name).toBe('Broken');
+		expect(flow[ 1 ].status).toBe('error');
+		expect(flow[ 1 ].parentId).toBe(flow[ 0 ].id);
 	});
 });
 
@@ -273,7 +277,7 @@ describe('trace: async edges close at chain settlement', () => {
 	beforeEach(() => clear());
 
 	it('a successful async call closes its edge ok with full-lifetime duration', async () => {
-		const ctx = { id: 'async-ok' };
+		const ctx = { id : 'async-ok' };
 		const fn = wrap(async () => {
 			await new Promise<void>((resolve) => {
 				setTimeout(resolve, 30);
@@ -287,12 +291,12 @@ describe('trace: async edges close at chain settlement', () => {
 
 		const flow = getFlow(ctx);
 		expect(flow.length).toBe(1);
-		expect(flow[0].status).toBe('ok');
-		expect(flow[0].duration).toBeGreaterThanOrEqual(25);
+		expect(flow[ 0 ].status).toBe('ok');
+		expect(flow[ 0 ].duration).toBeGreaterThanOrEqual(25);
 	});
 
 	it('an edge reads running ONLY while the async work is genuinely unsettled', async () => {
-		const ctx = { id: 'in-flight' };
+		const ctx = { id : 'in-flight' };
 		let gate: () => void = () => undefined;
 		const fn = wrap(async () => {
 			await new Promise<void>((resolve) => {
@@ -305,17 +309,17 @@ describe('trace: async edges close at chain settlement', () => {
 		const pending = fn();
 		// getFlow returns copies, so this is a snapshot of the in-flight state
 		const midFlow = getFlow(ctx);
-		expect(midFlow[0].status).toBe('running');
+		expect(midFlow[ 0 ].status).toBe('running');
 
 		gate();
 		await pending;
 
 		const endFlow = getFlow(ctx);
-		expect(endFlow[0].status).toBe('ok');
+		expect(endFlow[ 0 ].status).toBe('ok');
 	});
 
 	it('a promise resolving to a promise closes the edge only at the true end', async () => {
-		const ctx = { id: 'chain' };
+		const ctx = { id : 'chain' };
 		const fn = wrap(async () => {
 			await new Promise<void>((resolve) => {
 				setTimeout(resolve, 20);
@@ -324,8 +328,8 @@ describe('trace: async edges close at chain settlement', () => {
 				await new Promise<void>((resolve) => {
 					setTimeout(resolve, 20);
 				});
-				const result = 'deep';
-				return result;
+				const deepValue = 'deep';
+				return deepValue;
 			})();
 			// assimilation: the outer promise adopts the inner one; the tap
 			// fires only after the WHOLE chain settles, with the final value
@@ -338,13 +342,13 @@ describe('trace: async edges close at chain settlement', () => {
 
 		const flow = getFlow(ctx);
 		expect(flow.length).toBe(1);
-		expect(flow[0].status).toBe('ok');
+		expect(flow[ 0 ].status).toBe('ok');
 		// duration covers BOTH legs, not just the synchronous head
-		expect(flow[0].duration).toBeGreaterThanOrEqual(35);
+		expect(flow[ 0 ].duration).toBeGreaterThanOrEqual(35);
 	});
 
 	it('a rejection INSIDE a nested promise chain pins the error to the call', async () => {
-		const ctx = { id: 'chain-fail' };
+		const ctx = { id : 'chain-fail' };
 		const err = new Error('deep async boom');
 		const fn = wrap(async () => {
 			const inner = (async () => {
@@ -362,11 +366,11 @@ describe('trace: async edges close at chain settlement', () => {
 
 		const flow = getFlow(err);
 		expect(flow.length).toBe(1);
-		expect(flow[0].status).toBe('error');
+		expect(flow[ 0 ].status).toBe('error');
 	});
 
 	it('a promise resolving to a function delivers it wrapped, context intact', async () => {
-		const ctx = { id: 'fn-delivery' };
+		const ctx = { id : 'fn-delivery' };
 		const fn = wrap(async () => {
 			const deliveredFn = () => 'delivered-value';
 			return deliveredFn;
@@ -381,10 +385,11 @@ describe('trace: async edges close at chain settlement', () => {
 
 		const flow = getFlow(ctx);
 		expect(flow.length).toBe(2);
-		expect(flow[0].status).toBe('ok'); // the delivering call closed at settle
-		expect(flow[1].name).toBe('deliveredFn');
-		expect(flow[1].instance).toBe(ctx);
-		expect(flow[1].status).toBe('ok');
+		// the delivering call closed at settle
+		expect(flow[ 0 ].status).toBe('ok');
+		expect(flow[ 1 ].name).toBe('deliveredFn');
+		expect(flow[ 1 ].instance).toBe(ctx);
+		expect(flow[ 1 ].status).toBe('ok');
 	});
 });
 
@@ -392,8 +397,8 @@ describe('trace: interleaved concurrent flows stay separate', () => {
 	beforeEach(() => clear());
 
 	it('two flows failing interleaved recover their own data and branch', async () => {
-		const a = { id: 'A', requestId: 'req-A' };
-		const b = { id: 'B', requestId: 'req-B' };
+		const a = { id : 'A', requestId : 'req-A' };
+		const b = { id : 'B', requestId : 'req-B' };
 
 		const errA = new Error('boom-A');
 		const errB = new Error('boom-B');
@@ -425,7 +430,8 @@ describe('trace: interleaved concurrent flows stay separate', () => {
 			}, 5)),
 		]);
 
-		expect(seen).toEqual(['B', 'A']); // B fired first — interleaved
+		// B fired first — interleaved
+		expect(seen).toEqual([ 'B', 'A' ]);
 
 		// The OLD dive would clobber: the last writer wins the global context.
 		// The trace must give each error its OWN branch.
@@ -436,14 +442,14 @@ describe('trace: interleaved concurrent flows stay separate', () => {
 		const flowB = getFlow(errB);
 		expect(flowA.length).toBe(1);
 		expect(flowB.length).toBe(1);
-		expect(flowA[0].instance).toBe(a);
-		expect(flowB[0].instance).toBe(b);
-		expect(flowA[0].id).not.toBe(flowB[0].id);
+		expect(flowA[ 0 ].instance).toBe(a);
+		expect(flowB[ 0 ].instance).toBe(b);
+		expect(flowA[ 0 ].id).not.toBe(flowB[ 0 ].id);
 	});
 
 	it('wrap() restores context at rest — completed invocations do not leak', () => {
-		const a = { id: 'A' };
-		const b = { id: 'B' };
+		const a = { id : 'A' };
+		const b = { id : 'B' };
 
 		// inside each closure the capture is restored truthfully…
 		const readA = wrap(() => current(), a);
@@ -465,31 +471,32 @@ describe('trace: getFlow target resolution', () => {
 	it('getFlow() with no target returns the current cursor branch (empty at rest)', () => {
 		expect(getFlow()).toEqual([]);
 
-		const ctx = { id: 'live' };
+		const ctx = { id : 'live' };
 		wrap(() => {
 			const flow = getFlow();
 			expect(flow.length).toBe(1);
-			expect(flow[0].instance).toBe(ctx);
+			expect(flow[ 0 ].instance).toBe(ctx);
 		}, ctx)();
 
-		expect(getFlow()).toEqual([]); // back to rest
+		// back to rest
+		expect(getFlow()).toEqual([]);
 	});
 
 	it('getFlow on an unknown object returns an empty branch', () => {
-		expect(getFlow({ never: 'seen' })).toEqual([]);
+		expect(getFlow({ never : 'seen' })).toEqual([]);
 	});
 
 	it('returned edges are copies — mutating them does not corrupt the trace', () => {
-		const ctx = { id: 'immutable' };
+		const ctx = { id : 'immutable' };
 		wrap(() => undefined, ctx)();
 
 		const flow = getFlow(ctx);
 		expect(flow.length).toBe(1);
-		flow[0].name = 'MUTATED';
-		flow[0].status = 'error';
+		flow[ 0 ].name = 'MUTATED';
+		flow[ 0 ].status = 'error';
 
 		const fresh = getFlow(ctx);
-		expect(fresh[0].name).not.toBe('MUTATED');
-		expect(fresh[0].status).toBe('ok');
+		expect(fresh[ 0 ].name).not.toBe('MUTATED');
+		expect(fresh[ 0 ].status).toBe('ok');
 	});
 });

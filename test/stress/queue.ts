@@ -29,7 +29,7 @@ export function startConsumer (options?: {
 	const noThrow = options?.noThrow ?? false;
 	const startTime = Date.now();
 
-	return new Promise((resolve) => {
+	const consumerPromise = new Promise<void>((resolve) => {
 		function tick () {
 			if (registrySize() === 0 || Date.now() - startTime > timeoutMs) {
 				resolve();
@@ -60,7 +60,7 @@ export function startConsumer (options?: {
 						throw err;
 					}, instance)();
 				} catch (caught) {
-					pushToDlq({ error: caught as Error, errorType: 'sync-throw' });
+					pushToDlq({ error : caught as Error, errorType : 'sync-throw' });
 				}
 				if (!noThrow) throw err;
 			} else if (dice < 0.86) {
@@ -68,11 +68,12 @@ export function startConsumer (options?: {
 				// a wrapped rejection is pinned to the instance when it settles
 				const pending = wrap(() => Promise.reject(err), instance)() as Promise<unknown>;
 				pending.catch((caught: Error) => {
-					pushToDlq({ error: caught, errorType: 'unhandled-rejection' });
+					pushToDlq({ error : caught, errorType : 'unhandled-rejection' });
 				});
 				if (!noThrow) {
 					setImmediate(() => {
-						Promise.reject(err); // real boundary: already pinned above
+						// real boundary: already pinned above
+						Promise.reject(err);
 					});
 				}
 			} else {
@@ -80,9 +81,9 @@ export function startConsumer (options?: {
 				if (typeof childCtor === 'function') {
 					try {
 						// creationError hook pins the failure to the surviving parent
-						new (childCtor as new (data: unknown) => object)({ forceError: true });
+						new (childCtor as new (data: unknown) => object)({ forceError : true });
 					} catch (caught) {
-						pushToDlq({ error: caught as Error, errorType: 'creation-error' });
+						pushToDlq({ error : caught as Error, errorType : 'creation-error' });
 						if (!noThrow) throw caught;
 					}
 				} else {
@@ -92,7 +93,7 @@ export function startConsumer (options?: {
 							throw err;
 						}, instance)();
 					} catch (caught) {
-						pushToDlq({ error: caught as Error, errorType: 'sync-throw' });
+						pushToDlq({ error : caught as Error, errorType : 'sync-throw' });
 					}
 					if (!noThrow) throw err;
 				}
@@ -101,4 +102,5 @@ export function startConsumer (options?: {
 
 		setTimeout(tick, 50);
 	});
+	return consumerPromise;
 }

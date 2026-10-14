@@ -52,8 +52,8 @@ async function collectUntil (predicate: () => boolean, attempts = 60): Promise<b
 			setTimeout(resolve, 25);
 		});
 		if (predicate()) {
-			const result = true;
-			return result;
+			const collected = true;
+			return collected;
 		}
 	}
 	const result = false;

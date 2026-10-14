@@ -25,6 +25,15 @@ export default defineConfig({
 		globals     : true,
 		environment : 'node',
 		include     : ['test/**/*.spec.ts'],
+		coverage    : {
+			// Measure src/ only. build/ + build-cjs/ carry inline sourcemaps
+			// back to src/: the cjs-build spec loads build-cjs in-process,
+			// and its payload would remap onto src/index.ts as a second,
+			// barely-exercised copy of every function (the col-0 fnMap
+			// entries). Filtering at collection (the raw URL) keeps the
+			// report honest.
+			include : ['src/**'],
+		},
 	},
 	resolve : {
 		alias,

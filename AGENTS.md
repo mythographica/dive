@@ -9,10 +9,14 @@ coding dive itself.
 
 ## What this is
 
-Execution-flow tracing for the mnemonica stack: context is pinned to
-instances, errors carry their data, and the trace is object-linked — edges
+Standalone execution-flow tracing: context is pinned to the objects you
+wrap with, errors carry their data, and the trace is object-linked — edges
 hold their parents directly and live exactly as long as something alive
-keeps them (create/call edges, status, duration, parentage).
+keeps them (create/call edges, status, duration, parentage). The context
+follows the wrapped execution flow — the places where `wrap()` was put —
+not the runtime's own invocation flow. Mnemonica is one way to feed it
+(constructed instances become context automatically, via
+`@mnemonica/otel`'s `attachHooks`); dive itself needs nothing from it.
 
 Charter-level constraints (settled — do not re-litigate):
 
@@ -128,9 +132,7 @@ routes `require` to `build-cjs/index.js`, ESM stays the default condition.
    → `test/fixtures/uncaught-child.mjs`; `test/timer-uncaught.spec.ts` →
    `test/fixtures/timer-uncaught-child.mjs`). `pretest` runs `tsc` for exactly
    this reason — never run `vitest` bare and trust the result; a stale
-   `build/` makes behavior tests pass against yesterday's semantics. This
-   exact trap once hid a breaking trace-semantics change locally that CI
-   caught.
+   `build/` makes behavior tests pass against yesterday's semantics.
 2. **Behavior changes must break a test.** Pin behavior with snapshot-like
    assertions: deep-equal the full observed shape (edge kinds AND statuses
    AND durations), not just the fields you touched. If you change trace
@@ -141,7 +143,7 @@ routes `require` to `build-cjs/index.js`, ESM stays the default condition.
    only real in a plain node child (`--expose-gc` when GC assertions are
    involved). Assert on the child's single JSON stdout line. Never add
    probe env-switches to fixtures — do a one-time break-revert in src,
-   watch it go red, revert, log both runs under `/code/experiments/`.
+   watch it go red, revert, and keep both runs' logs as evidence.
 4. **GC assertions must flush the FinalizationRegistry.** Force GC, yield
    one macrotask, then read `stats` — the counters lag a GC by one task.
 5. **Negative controls prove mechanisms, not just happy paths.** Every
@@ -219,7 +221,7 @@ dive's context lives on the instance, not on the resource.
 
 ## The implementation walkthrough
 
-The whole machinery is one file (`src/index.ts`, ~1350 lines, no imports).
+The whole machinery is one file (`src/index.ts`, no imports).
 
 ### 0. The shape
 
@@ -231,7 +233,7 @@ FinalizationRegistries, and the `stats` counters.
 
 There is no start function. Dive is inert until **a wrapped function is
 invoked**. In a mnemonica app the *wiring* entrypoint is
-`attachHooks(collection)` (adapter side), which registers mnemonica
+`attachHooks(collection)` (in @mnemonica/otel), which registers mnemonica
 lifecycle hooks — but those hooks themselves only call dive primitives. So
 the real entrypoint, always, is: **somebody calls a function that `wrap()`
 returned.**
@@ -303,13 +305,13 @@ everything.
 - `current()` — just `lastContext`. Honest but newest-wins; ambiguous under
   concurrency by design.
 - `getFlow(target)` — resolve a starting edge (cursor / error's pinned
-  edge / instance's latest edge), then walk the `parents` links upward,
-  `unshift`ing into an array → the branch, oldest first. The walk reaches
-  exactly as far as something alive kept the chain.
+  edge / instance's latest edge), then walk the `parents` links upward
+  and return the branch oldest first. The walk reaches exactly as far as
+  something alive kept the chain.
 - `getErrorInstance(err)` — pinned instance; fallback: the instance of the
   pinned edge.
 
-### 6. How mnemonica instances enter the picture — `attachHooks` (adapter)
+### 6. How mnemonica instances enter the picture — `attachHooks` (@mnemonica/otel)
 
 - **preCreation**: `enterContext(parent)` + `wrapConstructorArg` on
   function args — callbacks handed to a constructor carry context, via a
@@ -324,24 +326,29 @@ everything.
 - **creationError**: `recordCreationError` — a failed `create` edge under
   the surviving parent, error pinned to it.
 
-### 7. End-to-end: one queue-proof request
+### 7. End-to-end: one queued request
 
-1. `POST /proof` → `new ProofEntity({uuid, marker, expect})`.
-   preCreation/postCreation fire → `create:ProofEntity` edge; `process`
-   gets wrapped on the prototype. HTTP response leaves. *Request cycle
+1. A request handler constructs `new Job({ uuid })`. With `attachHooks`
+   wired, preCreation/postCreation fire → a `create:Job` edge; `process`
+   gets wrapped on the prototype. The handler returns. *Request cycle
    over.*
-2. Seconds later, a `setTimeout` tick fires (unwrapped boundary, depth 0) →
-   `instance.process()` → wrapped method records `method:process`,
+2. Later, a queue tick fires (unwrapped boundary, depth 0) →
+   `job.process()` → the wrapped method records `method:process`,
    **parented on that instance's own `create` edge**, not on whatever ran
    last.
-3. `await` random delay → `throw` for marker 57 → the promise tap pins the
-   error to *this* edge + *this* instance → rethrows.
-4. The queue's `catch` calls `recordFailure(err)` →
-   `getErrorInstance(err)` → the instance → `utils.extract` →
-   `{uuid, marker}` → outcome stored.
-5. `GET /proof/:uuid` reads it back. The script asserts the marker matches
-   what *it* sent — which it can only do if step 2's parentage and step 3's
-   pinning never crossed wires.
+3. Inside, an `await` → `throw` → the promise tap pins the error to *this*
+   edge + *this* instance → rethrows.
+4. The queue's `catch` calls `getErrorInstance(err)` → the `Job` that
+   failed, and `getFlow(err)` → `create:Job → method:process`. Interleaved
+   requests cannot cross these wires: step 2's parentage comes from the
+   data, step 3's pin from the failing edge.
+
+The repository's tests pin each step without a framework:
+`test/als-vs-dive-real.spec.ts` (a decoupled queue recovers the origin
+from the error; interleaved flows stay separate branches) and
+`test/timer-uncaught.spec.ts` (a wrapped timer fires after the request
+returned, throws, and a real `uncaughtException` handler reads the data
+and the flow).
 
 That's the whole loop: **wrap at boundaries, record edges, parent on data,
 pin errors once, read from the error.** Everything else in the file
@@ -352,20 +359,19 @@ pin errors once, read from the error.** Everything else in the file
 Tabs, aligned colons in object literals, return-via-variable (every return
 goes through an intermediate const — debugger rule), no `any`.
 
-## How we work on dive
+## How to work on dive
 
-- **No git mutations by agents** — no commit/push/reset; the owner commits
-  at publish time. Working trees stay dirty by design.
-- **Experiments live in `/code/experiments/<date>-<name>/`** — soak servers,
-  load drivers, CDP smoke drivers, break-revert logs, all with a README.
-- **The owner publishes.** Version bumps and `npm publish` are not agent
-  work.
-- **Review happens in the room** (the mnemonica chat bus): post per-piece
-  greens with counts and diffs, the reviewer seat verifies, re-opens one
-  item at a time. Viktor reviews once at the end.
-- **Reports and memory hygiene:** `reports/` files describe current or open
-  state only; delete them once fulfilled or superseded (fix links that
-  referenced them). This file describes the present — no dated history, no
-  "we used to" narrative. Settled rationale lives here as present-tense
-  invariants; rejected designs stay recorded only while they prevent
-  re-derivation, then go.
+- **No git mutations by agents** — no commit/push/reset; the maintainer
+  commits. Leave changes uncommitted for review.
+- **The maintainer publishes.** Version bumps and `npm publish` are not
+  agent work.
+- **Experiments stay outside the package** — soak servers, load drivers,
+  break-revert logs: keep them with a README as evidence, never in `src/`,
+  `test/` or anything that ships.
+- **Report with evidence:** per change, the diff and the gate output
+  (lint, build, test) with counts; a report is a claim until a reviewer
+  re-runs it.
+- **This file describes the present** — no dated history, no "we used to"
+  narrative. Settled rationale lives here as present-tense invariants;
+  rejected designs stay recorded only while they prevent re-derivation,
+  then go.

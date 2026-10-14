@@ -26,22 +26,23 @@ describe('decoupled queue: recover origin after the request ends', () => {
 		const als = new AsyncLocalStorage<{ requestId: string }>();
 		const queue: string[] = [];
 
-		als.run({ requestId: 'req-A' }, () => {
+		als.run({ requestId : 'req-A' }, () => {
 			for (let i = 0; i < 5; i++) {
-				queue.push(`req-A-${i}`); // only the uuid leaves the request
+				// only the uuid leaves the request
+				queue.push(`req-A-${i}`);
 			}
 		});
 
 		const recovered: (string | undefined)[] = [];
 		await new Promise<void>((resolve) => setTimeout(() => {
-			for (const _uuid of queue) {
+			queue.forEach(() => {
 				// consumer holds only the uuid; ALS has no ambient store here
 				recovered.push(als.getStore()?.requestId);
-			}
+			});
 			resolve();
 		}, 5));
 
-		expect(recovered).toEqual([undefined, undefined, undefined, undefined, undefined]);
+		expect(recovered).toEqual([ undefined, undefined, undefined, undefined, undefined ]);
 	});
 
 	it('dive recovers the origin from the ERROR itself — no identifier map needed', async () => {
@@ -51,7 +52,7 @@ describe('decoupled queue: recover origin after the request ends', () => {
 		const queue: { uuid: string; requestId: string; payload: number }[] = [];
 
 		for (let i = 0; i < 5; i++) {
-			queue.push({ uuid: `req-A-${i}`, requestId: 'req-A', payload: i });
+			queue.push({ uuid : `req-A-${i}`, requestId : 'req-A', payload : i });
 		}
 
 		const recovered: (string | undefined)[] = [];
@@ -71,7 +72,7 @@ describe('decoupled queue: recover origin after the request ends', () => {
 			resolve();
 		}, 5));
 
-		expect(recovered).toEqual(['req-A', 'req-A', 'req-A', 'req-A', 'req-A']);
+		expect(recovered).toEqual([ 'req-A', 'req-A', 'req-A', 'req-A', 'req-A' ]);
 	});
 });
 
@@ -83,20 +84,20 @@ describe('concurrent flows: ALS auto-isolates; the dive TRACE isolates', () => {
 		const out: Record<string, string | undefined> = {};
 
 		await Promise.all([
-			new Promise<void>((res) => als.run({ id: 'A' }, () => setTimeout(() => {
+			new Promise<void>((res) => als.run({ id : 'A' }, () => setTimeout(() => {
 				out.A = als.getStore()?.id;
 				res();
 			}, 15))),
-			new Promise<void>((res) => als.run({ id: 'B' }, () => setTimeout(() => {
+			new Promise<void>((res) => als.run({ id : 'B' }, () => setTimeout(() => {
 				out.B = als.getStore()?.id;
 				res();
 			}, 5))),
 		]);
 
-		expect(out).toEqual({ A: 'A', B: 'B' });
+		expect(out).toEqual({ A : 'A', B : 'B' });
 	});
 
-	it("dive's bare current() IS newest-wins under interleaving (documented)", async () => {
+	it('dive\'s bare current() IS newest-wins under interleaving (documented)', async () => {
 		const collection = createTypesCollection();
 		attachHooks(collection);
 		const Entity = collection.define('Entity', function (this: { id: string }, id: string) {
@@ -112,8 +113,8 @@ describe('concurrent flows: ALS auto-isolates; the dive TRACE isolates', () => {
 
 	it('the dive trace isolates interleaved flows structurally', async () => {
 		const out: Record<string, unknown> = {};
-		const a = { id: 'A' };
-		const b = { id: 'B' };
+		const a = { id : 'A' };
+		const b = { id : 'B' };
 
 		await Promise.all([
 			(async () => {
@@ -169,12 +170,13 @@ describe('nodejs/diagnostics#249: callback pushed to a setInterval-drained queue
 			}, 10);
 
 			// FunctionWhereTrackingStarts: runs in a logical context, queues a task
-			als.run({ id: 'logical-A' }, () => {
+			als.run({ id : 'logical-A' }, () => {
 				queue.push(() => { seen = als.getStore()?.id; });
 			});
 		});
 
-		expect(result).toBeUndefined(); // ALS cannot bridge the sync context split
+		// ALS cannot bridge the sync context split
+		expect(result).toBeUndefined();
 	});
 
 	it('dive: wrap() carries the logical context into the queued callback', async () => {
@@ -192,13 +194,15 @@ describe('nodejs/diagnostics#249: callback pushed to a setInterval-drained queue
 			}, 10);
 
 			// FunctionWhereTrackingStarts: wrap the queued callback with the context
-			const logicalContext = { id: 'logical-A' };
+			const logicalContext = { id : 'logical-A' };
 			queue.push(wrap(() => {
 				seen = (current() as { id: string } | undefined)?.id;
 			}, logicalContext));
-			clear(); // even with ambient context wiped, the closure kept its capture
+			// even with ambient context wiped, the closure kept its capture
+			clear();
 		});
 
-		expect(result).toBe('logical-A'); // dive bridges the split via the closure
+		// dive bridges the split via the closure
+		expect(result).toBe('logical-A');
 	});
 });

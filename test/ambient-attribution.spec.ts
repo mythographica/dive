@@ -24,8 +24,8 @@ import {
 	getFlow,
 	registerHook,
 	clear,
+	type FlowEdge,
 } from '../src/index.js';
-import type { FlowEdge } from '../src/index.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -58,8 +58,8 @@ describe('instanceSource provenance', () => {
 	it('contextless wrap over an EMPTY ambient records no instance and no flag', () => {
 		// no instance exists to target getFlow at: the enter hook sees the edge
 		const seen: FlowEdge[] = [];
-		registerHook('enter', ({ edge }) => {
-			seen.push(edge);
+		registerHook('enter', ({ edge: entered }) => {
+			seen.push(entered);
 		});
 		const fn = wrap(() => 1, 'bare');
 		fn();
@@ -94,7 +94,7 @@ describe('instanceSource provenance', () => {
 		const stray = wrap(() => 'stray', 'stray');
 		stray();
 
-		await Promise.all([pendingA, pendingB]);
+		await Promise.all([ pendingA, pendingB ]);
 
 		// each edge is reachable from the branch it belongs to: the explicit
 		// flows from their contexts; the stray ambient capture and the
@@ -125,9 +125,9 @@ describe('instanceSource provenance', () => {
 
 		// Each branch reconstructs to exactly its own story
 		const branchA = getFlow(ctxA);
-		expect(branchA.map((e) => e.label)).toEqual(['flowA']);
+		expect(branchA.map((e) => e.label)).toEqual([ 'flowA' ]);
 		const branchB = getFlow(ctxB);
-		expect(branchB.map((e) => e.label)).toEqual(['flowB']);
+		expect(branchB.map((e) => e.label)).toEqual([ 'flowB' ]);
 	});
 
 	it('method edges are explicit: the receiver is the context', () => {

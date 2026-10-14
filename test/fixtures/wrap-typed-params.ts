@@ -6,7 +6,7 @@
  *
  * Not imported by any runtime test — test/type-level.spec.ts runs tsc on it.
  */
-import { wrap } from '../../src/index.js';
+import { wrap, Dive } from '../../src/index.js';
 
 const ctx = { id : 'ctx' };
 
@@ -41,3 +41,31 @@ void size;
 
 // @ts-expect-error — a wrong ctor arg must not compile
 new WrappedWidget('three');
+
+// the same contracts hold on a Dive instance's wrap()
+const app = new Dive();
+const appGreeter = app.wrap(function appGreeter (name: string): number {
+	return name.length;
+}, ctx);
+const appLen: number = appGreeter('hello');
+void appLen;
+
+// @ts-expect-error — a wrong arg type must not compile through Dive#wrap either
+appGreeter(42);
+
+const AppWidget = app.wrap(Widget, ctx);
+const appWidget = new AppWidget(3);
+const appSize: number = appWidget.size;
+void appSize;
+
+// @ts-expect-error — a wrong ctor arg must not compile through Dive#wrap either
+new AppWidget('three');
+
+// the class keeps the rest of the surface typed
+const appFlow = app.getFlow(ctx);
+void appFlow;
+const appHookOff = app.registerHook('enter', ({ edge }) => {
+	void edge.kind;
+});
+appHookOff();
+app.clear();

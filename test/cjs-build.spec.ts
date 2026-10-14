@@ -29,6 +29,7 @@ describe('build-cjs (F12)', () => {
 
 	it('exposes the full public API surface', () => {
 		const fns : (keyof DiveModule)[] = [
+			'Dive',
 			'wrap',
 			'current',
 			'getFlow',

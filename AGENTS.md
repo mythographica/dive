@@ -26,9 +26,16 @@ Charter-level constraints (settled — do not re-litigate):
   violates the charter no matter where it is placed. The edge lifecycle
   hooks are the escape hatch — a subscriber sees an escaped callback as a
   missing continuation.
-- **Dive is a singleton.** Multi-instance (`createDive`) was designed and
-  parked: no evidence of two real tenants needing isolated traces in one
-  process. Revisit only with that evidence.
+- **The default dive plus `new Dive()`.** The package entry creates the
+  default dive (the free functions); the `Dive` class gives an app an
+  isolated dive of its own — own edges, counters, hooks, context. State is
+  the isolation boundary: two dives never read or write each other's stores,
+  parentage never crosses dives, and one dive's hooks never fire for
+  another's calls. What dives SHARE are the `Symbol.for` marks on user
+  objects (wrappedness, pinned errors): they live on the functions and
+  errors, not in any dive, so double-wrap detection works across dives (and
+  across the dual build) and wrappers never stack. The full rule set, with
+  the tests that pin it: README "new Dive()" and `test/dive-instance.spec.ts`.
 - **Emission, never ingestion.** Dive publishes enter/leave/settle/
   recontext/create; subscribers (OTel vendors, monitoring layers) correlate
   from THEIR side at the one moment both trees share a frame. Subscriber
@@ -89,8 +96,8 @@ Charter-level constraints (settled — do not re-litigate):
   stacks. An opt-in capture flag is the accepted escape hatch if ever
   needed — never always-on.
 - **The dual-package split is real.** `require` → `build-cjs/`, `import` →
-  `build/`; module-level state means the two flavors are separate instances
-  in one process. A `createRequire`-based reader (strategy's cdp-scripts)
+  `build/`; each flavor creates its own default dive, so the two flavors are
+  separate instances in one process. A `createRequire`-based reader (strategy's cdp-scripts)
   cannot see an ESM target's trace and vice versa — CDP-evaluated code has
   no dynamic-import callback, so the payload path cannot reach the ESM
   instance. Documented in the README as a usage caveat; bridging would
@@ -100,8 +107,8 @@ Charter-level constraints (settled — do not re-litigate):
   handler returns — extract and ship synchronously inside the handler; a
   later poller may find payloads collected.
 - **`clear()` means reset.** Object links, running store, cursor, depth,
-  context, counters, AND all subscribers. Adapter wiring must re-register
-  after it.
+  context, counters, AND all subscribers — of that ONE dive; other dives are
+  untouched. Adapter wiring must re-register after it.
 - **`edge.drop()` is the explicit eviction override.** Method ON AN EDGE
   (not a dive export — a global drop would make later uncaughtException
   flows unexplained), walking from that edge up to the root. `drop()`
@@ -157,7 +164,19 @@ routes `require` to `build-cjs/index.js`, ESM stays the default condition.
 
 ## Internals
 
-The store is object-linked (no `async_hooks`, no buffer):
+One domain per file under `src/`: `constants.ts` (Symbol.for keys, the
+status/kind vocabulary), `types.ts` (the public types), `state.ts` (the
+per-dive state object), `store.ts` (the Edge class + recording + clear),
+`hooks.ts` (the lifecycle registry + dispatch), `callsite.ts` (wrap-site
+capture), `wrap.ts` (the wrap machinery), `flow.ts` (creation recording +
+the read side), `dive.ts` (the `Dive` class), `index.ts` (the default dive's
+public entry: one `new Dive()`, its bound methods exported as the free
+functions). Every state-touching function takes the acting dive's state as
+its first parameter; an edge carries its owning state as a declared private
+field (constructor-set, so the Edge hidden class stays one shape — the
+fast-properties layout is pinned by test/flow-edge-shape.spec.ts).
+
+The store is object-linked (no `async_hooks`, no buffer), per dive:
 
 - `parents` — a `WeakMap<Edge, Edge>`: each edge's execution parent. The
   trace is not a container at all — it is the edges' own links. An edge is
@@ -221,13 +240,18 @@ dive's context lives on the instance, not on the resource.
 
 ## The implementation walkthrough
 
-The whole machinery is one file (`src/index.ts`, no imports).
-
 ### 0. The shape
 
-Module-level mutable state plus functions: `parents`, `latestEdges`,
-`runningEdges`, `cursor: Edge | null`, `activeDepth`, `lastContext`, two
-FinalizationRegistries, and the `stats` counters.
+A per-dive state object (state.ts: one per `Dive` instance, the default
+dive's created in index.ts) plus domain functions that take it as their
+first parameter: `cursor: Edge | null`, `activeDepth`, `lastContext`, the
+`parents`/`latestEdges` WeakMaps, `runningEdges`, the `copySource` weak
+side-links, two FinalizationRegistries, the `stats` counters, and the hooks
+lists. The fields the lifecycle reassigns (the WeakMaps `clear()` swaps, the
+era token, the counters) are get/set accessors on the state object, so the
+domain files both read and reassign them through the one object. The `Dive`
+class (dive.ts) and the free functions (index.ts) are thin delegating
+surfaces over the same domain functions.
 
 ### 1. The entrypoint
 
@@ -264,7 +288,11 @@ through untouched.
    before the tap fires, so promise-in-promise needs no wrapping of its
    own — resolved functions get wrapped, rejections get
    `pinError(error, edge, context)` then re-throw.
-8. Sync throw → `pinError`, rethrow.
+8. Sync throw → the catch records (`pinError`) and falls through; the
+   rethrow lives at the end of the `finally` (a boolean flag, not the
+   value — userland may throw `undefined`). A catch that always rethrows
+   would leave the try statement's "catch completes normally" arm
+   unreachable forever; this shape keeps every arm real.
 9. `finally`: restore `cursor`, `activeDepth--`, restore `lastContext`
    (for promises, `duration` is stamped at settlement by step 7's tap).
    The state machine is back exactly where the caller left it.
@@ -298,7 +326,9 @@ site. Two non-enumerable symbols go onto the error: `mnemonica.dive.edge`
 as the Error lives) and `mnemonica.dive.instance` (the data). That's the
 whole trick behind crash attribution: the error *carries* its provenance, so
 `uncaughtException` — where ALS's store is long dead — can still recover
-everything.
+everything. A carrier that cannot take properties (a frozen error) is never
+pinned: the edge has already settled `'error'` by then, so the failure is
+recorded but no `defineProperty` throw may mask the original error.
 
 ### 5. The read paths
 

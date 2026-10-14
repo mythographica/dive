@@ -33,6 +33,9 @@ export default defineConfig({
 			// entries). Filtering at collection (the raw URL) keeps the
 			// report honest.
 			include : ['src/**'],
+			// types.ts is pure type declarations — it compiles to `export {}`,
+			// there is nothing to cover.
+			exclude : ['src/types.ts'],
 		},
 	},
 	resolve : {

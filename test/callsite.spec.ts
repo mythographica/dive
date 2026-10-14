@@ -157,4 +157,51 @@ describe('callsite under --enable-source-maps (child process on build/)', () => 
 		expect(name).not.toContain('dive/src');
 		expect(name).not.toContain('dive/build');
 	});
+
+	it('skips dive-internal frames in plain build/ (ESM, unmapped)', () => {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const childScript = path.join(here, 'fixtures', 'callsite-mapped-child.mjs');
+		const out = execFileSync(
+			process.execPath,
+			[ childScript ],
+			{ encoding : 'utf8' },
+		);
+		const { name } = JSON.parse(out) as { name : string };
+		expect(name).toMatch(/callsite-mapped-child\.mjs:\d+:\d+$/);
+		expect(name).not.toContain('dive/src');
+		expect(name).not.toContain('dive/build');
+	});
+});
+
+describe('callsite in the CJS build (child processes on build-cjs/)', () => {
+	// Same directory-skip contract for the require() flavor — the split means
+	// dive's internal frames span several files in one directory, in both
+	// flavors.
+	it('skips dive-internal frames in plain build-cjs/', () => {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const childScript = path.join(here, 'fixtures', 'callsite-cjs-child.cjs');
+		const out = execFileSync(
+			process.execPath,
+			[ childScript ],
+			{ encoding : 'utf8' },
+		);
+		const { name } = JSON.parse(out) as { name : string };
+		expect(name).toMatch(/callsite-cjs-child\.cjs:\d+:\d+$/);
+		expect(name).not.toContain('dive/src');
+		expect(name).not.toContain('dive/build');
+	});
+
+	it('skips dive-internal frames that resolve to src/*.ts via the inline map', () => {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const childScript = path.join(here, 'fixtures', 'callsite-cjs-child.cjs');
+		const out = execFileSync(
+			process.execPath,
+			[ '--enable-source-maps', childScript ],
+			{ encoding : 'utf8' },
+		);
+		const { name } = JSON.parse(out) as { name : string };
+		expect(name).toMatch(/callsite-cjs-child\.cjs:\d+:\d+$/);
+		expect(name).not.toContain('dive/src');
+		expect(name).not.toContain('dive/build');
+	});
 });

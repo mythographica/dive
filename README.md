@@ -504,6 +504,49 @@ registerHook('settle', ({ edge, error }) => {
 });
 ```
 
+### `new Dive()`
+
+Everything above is the **default dive** — the module-level free functions.
+An app can hold a dive of its own, the same way mnemonica's
+`createTypesCollection()` sits next to its default collection:
+
+```typescript
+import { Dive } from '@mnemonica/dive';
+
+const appDive = new Dive();
+
+appDive.registerHook('enter', ({ edge }) => { /* only this dive's edges */ });
+const work = appDive.wrap(function work () { /* ... */ }, context);
+work();
+appDive.getFlow(context);   // this dive's branch, nothing else's
+appDive.clear();            // resets THIS dive only
+```
+
+When you would want your own: a test suite that must not leak trace state
+into the code under test, a plugin host giving each tenant its own trace, or
+two instrumented libraries whose stories must never merge.
+
+The isolation rules (pinned by `test/dive-instance.spec.ts`):
+
+- **State is the boundary.** Each dive owns its edges, counters, stats,
+  running store, hooks and context. One dive's hooks never fire for another
+  dive's calls; `clear()` resets exactly one dive.
+- **Wrap marks are shared on purpose.** Wrappedness and the pinned-error
+  symbols are process-global `Symbol.for` keys on the *user's objects*, so
+  double-wrap detection works no matter which dive meets a function, and
+  wrappers never stack. Recording always lands in the dive whose API
+  performed the wrap; a cross-dive re-wrap with a different context is the
+  usual shadowing handoff, recorded in the acting dive. Method wrapping is
+  first-dive-wins for the same reason.
+- **Parentage never crosses dives.** A call wrapped by dive A records only
+  in dive A — even when it runs inside a call wrapped by dive B, it does not
+  become a child of B's edge (B's record is its own). Each dive's
+  `current()` is likewise its own.
+- **The read side honours the boundary.** `getFlow()` starts only from the
+  dive's own edges — a foreign edge, copy or pinned error is not an anchor.
+  `getErrorInstance(error)` stays the exception: the pin rides on the error
+  object, so the crash handler recovers the data whichever dive it holds.
+
 ---
 
 ## The Execution-Flow Trace
@@ -772,12 +815,13 @@ process-level escapes and arbitrary queue reordering.
 ### The CJS/ESM instance split
 
 The package dual-builds: `import` resolves to `build/` (ESM), `require` to
-`build-cjs/` (CJS). Dive's trace state is module-level, so the two flavors
-are **separate instances in the same process**: edges recorded through the
-ESM entry are invisible to a `require('@mnemonica/dive')` reader, and vice
-versa. As a user, just know that if your code mixes both entry styles (rare,
-but e.g. an ESM app inspected by a `createRequire`-based tool), the two
-sides see different traces. Pick one entry style per process and stay with it.
+`build-cjs/` (CJS). The trace state lives in the **default dive**, created
+once per build flavor, so the two flavors are **separate instances in the
+same process**: edges recorded through the ESM entry are invisible to a
+`require('@mnemonica/dive')` reader, and vice versa. As a user, just know
+that if your code mixes both entry styles (rare, but e.g. an ESM app
+inspected by a `createRequire`-based tool), the two sides see different
+traces. Pick one entry style per process and stay with it.
 
 ---
 

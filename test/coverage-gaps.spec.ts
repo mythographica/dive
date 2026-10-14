@@ -7,6 +7,10 @@
  *   - edge.drop() during the call releases the cursor mid-flight
  *   - targeted drop() walks edges that were recorded without an instance
  *   - a thrown non-object pins nothing and leaves the edge running
+ *   - a thrown FROZEN error cannot take the pin: it propagates untouched
+ *     (pinError skips non-extensible carriers — a defineProperty throw would
+ *     mask the original), on all three pinning paths (sync throw, async
+ *     rejection with the settle hook still firing, recordCreationError)
  *   - isWrappedFunction() rejects non-function values (adapter probing)
  *   - dive survives a degraded stack environment (unparseable Error.stack):
  *     no callsite, 'anonymous' caption fallbacks — fresh module instance
@@ -255,6 +259,70 @@ describe('error pinning guards', () => {
 		// the flight recorder still reaches the failing edge itself
 		expect(getFlow(caught)).toHaveLength(1);
 		expect(getFlow(caught)[ 0 ].name).toBe('failBody');
+	});
+
+	it('a FROZEN thrown error cannot take the pin: it propagates untouched, the edge still settles error', () => {
+		// pinError skips non-extensible carriers (defineProperty would throw
+		// and mask the original error). The edge has already settled 'error'
+		// before the pin attempt, and the state machine restores — so the
+		// failure is recorded, attribution degrades, the user's error never
+		// does.
+		const ctx = { id : 'ctx' };
+		const frozen = Object.freeze(new Error('frozen boom'));
+		const fn = wrap(function frozenThrower () { throw frozen; }, ctx);
+		let caught: unknown;
+		try {
+			fn();
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught).toBe(frozen);
+		// no pin could be installed: attribution is absent, never guessed
+		expect(getErrorInstance(frozen)).toBeUndefined();
+		const flow = getFlow(ctx);
+		expect(flow).toHaveLength(1);
+		expect(flow[ 0 ].status).toBe('error');
+		expect(stats.running).toBe(0);
+		expect(current()).toBeUndefined();
+		// the state machine is back exactly where the caller left it
+		const after = wrap(function afterRecovery () { return 7; }, ctx);
+		expect(after()).toBe(7);
+		expect(stats.running).toBe(0);
+	});
+
+	it('a FROZEN rejection propagates untouched and the settle hook still fires', async () => {
+		const ctx = { id : 'ctx' };
+		const frozen = Object.freeze(new Error('frozen rejection'));
+		const settled: { result : unknown; error : unknown }[] = [];
+		registerHook('settle', ({ result, error }) => {
+			settled.push({ result, error });
+		});
+		const fn = wrap(async function frozenRejecter () { throw frozen; }, ctx);
+		await expect(fn()).rejects.toBe(frozen);
+		expect(settled).toEqual([ { result : undefined, error : frozen } ]);
+		const flow = getFlow(ctx);
+		expect(flow).toHaveLength(1);
+		expect(flow[ 0 ].status).toBe('error');
+		expect(stats.running).toBe(0);
+	});
+
+	it('recordCreationError with a FROZEN error records the failed create edge and never throws', () => {
+		const parent = { id : 'parent' };
+		const frozen = Object.freeze(new Error('frozen creation'));
+		const created: { name : string; error : unknown }[] = [];
+		registerHook('create', ({ edge, error }) => {
+			created.push({ name : edge.name, error });
+		});
+		recordCreationError('FrozenType', frozen, parent);
+		expect(created).toEqual([ { name : 'FrozenType', error : frozen } ]);
+		const flow = getFlow(parent);
+		expect(flow).toHaveLength(1);
+		expect(flow[ 0 ].kind).toBe('create');
+		expect(flow[ 0 ].status).toBe('error');
+		// the errored object itself becomes current() (a non-object failure
+		// would switch to the surviving parent instead)
+		expect(current()).toBe(frozen);
+		expect(getErrorInstance(frozen)).toBeUndefined();
 	});
 });
 
